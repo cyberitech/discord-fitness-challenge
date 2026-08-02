@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Node / SPA
+node_modules/
+dist/
+web/dist/
+
+# Runtime data — fcb.db, screenshots, anything the app writes
+data/
+
+# Secrets
+.env
+*.pem
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Source avatar — resized copies live in src/fcb/dashboard/static/ and are committed
+avatar.png

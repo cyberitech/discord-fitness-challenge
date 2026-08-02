@@ -1,0 +1,50 @@
+[project]
+name = "fcb"
+version = "0.1.0"
+description = "Fitness Challenge Bot"
+requires-python = ">=3.12"
+dependencies = [
+    "discord.py>=2.4",
+    "strands-agents>=0.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+    "itsdangerous>=2.2",
+    "boto3>=1.35",
+    "pillow>=12.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "mypy>=1.11",
+    "flake8>=7",
+    "isort>=5",
+    "black>=24",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fcb"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/fcb"]
+
+[dependency-groups]
+dev = [
+    "pyflakes>=3.4.0",
+]

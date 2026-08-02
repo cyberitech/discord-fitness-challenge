@@ -1,0 +1,19 @@
+[Unit]
+Description=FCB Dashboard Web
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/discord_bot_fitness_challenge
+EnvironmentFile=/home/ubuntu/discord_bot_fitness_challenge/.env
+ExecStart=/home/ubuntu/.local/bin/uv run python -m fcb.dashboard
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
