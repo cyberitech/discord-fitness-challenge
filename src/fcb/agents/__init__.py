@@ -89,21 +89,21 @@ Pattern A — cumulative snapshots of ONE session:
   at different moments. Same machine, same session.
 
   Treat as ONE workout:
-  1. Sort by cumulative distance ascending. The first image has the
-     smallest distance; the last image has the largest.
-  2. For each transition, compute the segment elevation using the
-     incline shown on that image:
-        segment_elev = (distance_N - distance_{N-1}) * 5280 * (grade_N / 100)
-     For the first image, use its own distance and grade directly.
-  3. Sum the segment elevations for the session total.
-  4. Take duration_seconds, calories, distance_miles from the LAST
-     image — they are cumulative as of that moment.
-  5. Return ONE workout for the whole session.
+  - Sort the images by cumulative distance ascending.
+  - Compute elevation per segment as (that segment's delta distance
+    in miles) * 5280 * (that segment's incline percent / 100). The
+    first segment uses the earliest image's own distance and grade;
+    every later segment uses the distance delta from the prior image
+    together with its own grade. Sum the per-segment elevations for
+    the session total.
+  - Take duration_seconds, calories, distance_miles from the LAST
+    image — they are cumulative as of that moment.
+  - Return ONE workout for the whole session.
 
   Example: image A shows 1.01 mi at 15% incline. Image B shows 1.05 mi
   at 7.5% incline. This is a workout + cooldown on ONE session.
-     segment 1: 1.01 * 5280 * 0.15 = 799 ft
-     segment 2: (1.05 - 1.01) * 5280 * 0.075 = 16 ft
+     first segment: 1.01 * 5280 * 0.15 = 799 ft
+     next segment: (1.05 - 1.01) * 5280 * 0.075 = 16 ft
      total: ~815 ft elevation, 1.05 mi distance.
 
 Pattern B — SEPARATE sessions on the same machine:

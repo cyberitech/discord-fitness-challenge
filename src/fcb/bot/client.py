@@ -75,14 +75,52 @@ def _image_format(attachment: discord.Attachment) -> str | None:
 _MAX_IMAGE_BYTES = 4_500_000  # 4.5 MB — safe margin below Bedrock's 5 MB limit
 
 
-def _downsize_image(image_bytes: bytes, image_format: str) -> tuple[bytes, str]:
-    """Reduce image size to fit within Bedrock's limit.
+def _sniff_image_format(image_bytes: bytes) -> str | None:
+    """Return the format the raw bytes actually are, from magic bytes.
 
-    Converts to JPEG (lossy) and scales down progressively until under
-    _MAX_IMAGE_BYTES. Returns (resized_bytes, format). The format may
-    change to 'jpeg' even if the input was PNG/WebP since JPEG compresses
-    better for photos.
+    Discord's ``content_type`` and filename extension are inferred from
+    what the uploading client sent, and iPhone/Android screenshots
+    routinely arrive as PNG bytes under a ``.jpg`` filename. Bedrock
+    now validates the declared media type against the actual bytes and
+    rejects the whole call when they disagree, so we MUST label
+    images by what they truly are.
+
+    Returns one of 'png', 'jpeg', 'gif', 'webp', or None if the bytes
+    are shorter than any header or don't match a supported format.
     """
+    if len(image_bytes) < 12:
+        return None
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if image_bytes.startswith(b"GIF87a") or image_bytes.startswith(b"GIF89a"):
+        return "gif"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _downsize_image(image_bytes: bytes, image_format: str) -> tuple[bytes, str]:
+    """Prepare an image for Bedrock: correct the format label, then shrink
+    it if it exceeds the size limit.
+
+    Bedrock rejects the whole call when the declared media type disagrees
+    with the image's magic bytes, so this function first sniffs the real
+    format from the bytes and overrides the caller-supplied label if
+    they disagree. Then, if the image is over ``_MAX_IMAGE_BYTES``, it
+    re-encodes to JPEG (lossy) and scales down until it fits. Returns
+    ``(bytes, format)`` where ``format`` is always the true format of
+    the returned bytes.
+    """
+    sniffed = _sniff_image_format(image_bytes)
+    if sniffed is not None and sniffed != image_format:
+        logger.info(
+            f"image label mismatch: attachment claimed {image_format!r} but "
+            f"bytes are {sniffed!r}; sending as {sniffed!r}"
+        )
+        image_format = sniffed
+
     if len(image_bytes) <= _MAX_IMAGE_BYTES:
         return image_bytes, image_format
 
@@ -833,6 +871,10 @@ class FCBClient(discord.Client):
             await interaction.response.defer(ephemeral=False, thinking=True)
 
             image_bytes = await attachment.read()
+            # Correct the format label from the actual bytes and downsize
+            # if needed. Bedrock rejects the call outright when the
+            # declared format disagrees with the magic bytes.
+            image_bytes, image_format = _downsize_image(image_bytes, image_format)
             event = await asyncio.to_thread(
                 dao.get_active_event,
                 guild_id,
@@ -2156,15 +2198,37 @@ class FCBClient(discord.Client):
             dao.find_duplicate_hashes, [s["hash"] for s in saved]
         )
         if dup_map:
-            # Build a human-readable list of dup references
+            # Build a human-readable list of dup references. The link
+            # points at the original Discord message so anyone in the
+            # channel can jump to it. The dashboard link is a fallback
+            # for historical rows that lack the guild/channel scope
+            # (pre-migration-012 submissions).
             dup_lines: list[str] = []
             for i, s in enumerate(saved):
-                if s["hash"] in dup_map:
-                    original_id = dup_map[s["hash"]]
-                    dup_lines.append(
-                        f"image {i + 1} matches submission "
-                        f"[#{original_id}]({config.FCB_PUBLIC_BASE_URL}/submissions/{original_id})"
+                if s["hash"] not in dup_map:
+                    continue
+                original_id = dup_map[s["hash"]]
+                orig = await asyncio.to_thread(dao.get_submission, original_id)
+                if (
+                    orig is not None
+                    and orig.get("guild_id")
+                    and orig.get("channel_id")
+                    and orig.get("message_id")
+                ):
+                    # message_id carries a per-image suffix like "_0"
+                    # for multi-image submissions; strip it for the URL.
+                    orig_msg_id = str(orig["message_id"]).split("_", 1)[0]
+                    link = (
+                        f"https://discord.com/channels/"
+                        f"{orig['guild_id']}/{orig['channel_id']}/{orig_msg_id}"
                     )
+                else:
+                    link = (
+                        f"{config.FCB_PUBLIC_BASE_URL}/submissions/{original_id}"
+                    )
+                dup_lines.append(
+                    f"image {i + 1} matches submission [#{original_id}]({link})"
+                )
             logger.info(
                 f"duplicate detected for message {message.id}: {dup_lines}"
             )
