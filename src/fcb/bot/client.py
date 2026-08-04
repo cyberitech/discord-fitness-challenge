@@ -21,6 +21,8 @@ from discord import app_commands
 from discord.ext import tasks
 from PIL import Image
 
+import imagehash
+
 from fcb import config, runtime_config
 from fcb.agents import router, vision, voice
 from fcb.agents.vision import WorkoutStats
@@ -123,6 +125,20 @@ def _downsize_image(image_bytes: bytes, image_format: str) -> tuple[bytes, str]:
         f"(800px wide, quality=50 — heavy compression)"
     )
     return buf.getvalue(), "jpeg"
+
+
+def _phash(image_bytes: bytes) -> str:
+    """Compute a perceptual hash of an image.
+
+    Uses ``imagehash.phash`` (16x16 DCT hash by default). Two visually
+    similar images produce the same or near-identical hashes even across
+    re-encoding — good for catching a user re-uploading the same
+    screenshot at a different quality.
+
+    Returns the hex string form so it can be stored as-is in SQLite.
+    """
+    img = Image.open(io.BytesIO(image_bytes))
+    return str(imagehash.phash(img))
 
 
 _METRIC_LABELS = {
@@ -1694,6 +1710,16 @@ class FCBClient(discord.Client):
             await self._process_workout_images(guild_id, message, image_attachments)
             return
 
+        # Reply to a bot clarification question?
+        if message.reference and message.reference.message_id:
+            pending_subs = await asyncio.to_thread(
+                dao.get_submissions_by_clarification_message,
+                str(message.reference.message_id),
+            )
+            if pending_subs and pending_subs[0]["discord_user_id"] == author_id:
+                await self._handle_clarification_reply(guild_id, message, pending_subs)
+                return
+
         if self.user is not None and self._is_bot_addressed(message):
             await self._handle_mention(guild_id, message)
             return
@@ -2070,369 +2096,703 @@ class FCBClient(discord.Client):
         )
 
     async def _process_workout_images(
-        self, guild_id: str, message: discord.Message, attachments: list[discord.Attachment]
+        self,
+        guild_id: str,
+        message: discord.Message,
+        attachments: list[discord.Attachment],
     ) -> None:
-        """Process all image attachments in a message, post one consolidated reply."""
-        results: list[dict] = []
-        for i, attachment in enumerate(attachments):
-            suffix = f"_{i}" if len(attachments) > 1 else ""
-            result = await self._process_workout_image(guild_id, message, attachment, msg_id_suffix=suffix)
-            if result:
-                results.append(result)
+        """Process all image attachments in a message as ONE vision batch.
 
-        if not results:
-            return
-
-        # Build a single consolidated reply
-        approved = [r for r in results if r["recognized"]]
-        rejected = [r for r in results if not r["recognized"]]
-
-        if not approved:
-            # Nothing matched — stay silent in reply_only mode, or riff
-            return
-
-        # Single voice acknowledgment covering the batch
-        if len(approved) == 1:
-            voice_line = approved[0]["voice_line"]
-        else:
-            # Multiple approved images — generate a combined voice line
-            active_events = await asyncio.to_thread(dao.list_active_events, guild_id)
-            total_stats: dict[str, float] = {}
-            event_names: set[str] = set()
-            for r in approved:
-                for key in ("elevation_gain_feet", "duration_seconds", "distance_miles", "calories", "reps", "volume_lb"):
-                    val = r["stats"].get(key)
-                    if val:
-                        total_stats[key] = total_stats.get(key, 0) + float(val)
-                event_names.add(r["event_name"])
-
-            combined_stats = {**approved[0]["stats"], **total_stats}
-            primary_event = approved[0]["primary_event"]
-            voice_line = await asyncio.to_thread(
-                voice.acknowledge_workout,
-                guild_id=guild_id,
-                user_display_name=message.author.display_name,
-                event_name=primary_event["name"],
-                event_prompt=primary_event["prompt"],
-                stats=combined_stats,
-            )
-
-        submission_ids = [r["submission_id"] for r in approved]
-        summaries = [r["summary"] for r in approved]
-        footer_parts = [f"{len(approved)} images logged"]
-        if len(summaries) == 1:
-            footer_parts = [summaries[0]]
-        footer_parts.append(f"submissions #{', #'.join(str(s) for s in submission_ids)}")
-
-        await message.reply(
-            f"<@{message.author.id}> {voice_line}\n"
-            f"-# {' · '.join(footer_parts)}"
-        )
-
-    async def _process_workout_image(
-        self, guild_id: str, message: discord.Message, attachment: discord.Attachment,
-        msg_id_suffix: str = "",
-    ) -> dict | None:
-        """Process a single image. Returns a result dict if recognized, None otherwise."""
+        Steps:
+        1. Save every image to disk and compute its perceptual hash.
+        2. Reject any image whose hash already exists on an APPROVED submission.
+           When a hash matches, tell the user and stop — do not partially
+           process the batch.
+        3. If no active events, insert rejected placeholder rows and stay
+           silent (or riff, per ``bot.reply_only_on_challenge_match``).
+        4. Otherwise, run vision once over ALL images. Vision returns a
+           SessionBatch describing how many sessions are in the batch and
+           which images belong to which session.
+        5. For each session in the batch, insert one submission (approved
+           if a router match, rejected otherwise) plus one submission_images
+           row per contributing image. If the batch needs clarification,
+           insert all sessions as pending and post the clarification
+           question instead of the acknowledgement.
+        6. Post one consolidated voice acknowledgement covering the batch.
+        """
         author_id = str(message.author.id)
-        image_format = _image_format(attachment)
-        assert image_format is not None  # already filtered
-        effective_message_id = str(message.id) + msg_id_suffix
 
-        # Screenshot is always saved first so admins and the dashboard have
-        # the artifact even when the bot goes silent on non-recognition.
-        image_bytes = await attachment.read()
-        safe_name = re.sub(r"[^\w.\-]", "_", attachment.filename)
-        screenshot_path = config.FCB_SCREENSHOTS_DIR / f"{message.id}_{safe_name}"
-        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-        screenshot_path.write_bytes(image_bytes)
-        rel_image_path = str(screenshot_path.relative_to(config.REPO_ROOT))
-        logger.info(f"saved screenshot to {screenshot_path} ({len(image_bytes)} bytes)")
-
-        # Downsize if over Bedrock's limit before sending to vision
-        image_bytes, image_format = _downsize_image(image_bytes, image_format)
-
-        active_events = await asyncio.to_thread(
-            dao.list_active_events,
-            guild_id,
-        )
-
-        # Recognition rule: the bot only posts an acknowledgement when the
-        # image is a workout screenshot AND it maps to an active challenge.
-        # Every other outcome persists the submission for admin review but
-        # produces no channel reply. Users who want to know why can
-        # @-mention the bot; the chat_reply path reads recent submissions.
-        if not active_events:
-            submission_id = await asyncio.to_thread(
-                dao.insert_submission,
-                guild_id=guild_id,
-                event_id=None,
-                discord_user_id=author_id,
-                message_id=effective_message_id,
-                channel_id=str(message.channel.id),
-                posted_at=message.created_at.isoformat(),
-                image_path=rel_image_path,
-                raw_text=message.content or None,
-                extracted_stats=None,
-                status="rejected",
+        # Step 1 — save + hash every image
+        saved: list[dict] = []  # per-attachment: image_bytes, format, path, hash
+        for attachment in attachments:
+            fmt = _image_format(attachment)
+            if fmt is None:
+                continue
+            image_bytes = await attachment.read()
+            safe_name = re.sub(r"[^\w.\-]", "_", attachment.filename)
+            screenshot_path = config.FCB_SCREENSHOTS_DIR / f"{message.id}_{safe_name}"
+            screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+            screenshot_path.write_bytes(image_bytes)
+            rel_image_path = str(screenshot_path.relative_to(config.REPO_ROOT))
+            image_hash = await asyncio.to_thread(_phash, image_bytes)
+            logger.info(
+                f"saved screenshot to {screenshot_path} ({len(image_bytes)} bytes, "
+                f"phash={image_hash})"
             )
+            saved.append(
+                {
+                    "bytes": image_bytes,
+                    "format": fmt,
+                    "path": rel_image_path,
+                    "hash": image_hash,
+                }
+            )
+
+        if not saved:
+            return
+
+        # Step 2 — duplicate check
+        dup_map = await asyncio.to_thread(
+            dao.find_duplicate_hashes, [s["hash"] for s in saved]
+        )
+        if dup_map:
+            # Build a human-readable list of dup references
+            dup_lines: list[str] = []
+            for i, s in enumerate(saved):
+                if s["hash"] in dup_map:
+                    original_id = dup_map[s["hash"]]
+                    dup_lines.append(
+                        f"image {i + 1} matches submission "
+                        f"[#{original_id}]({config.FCB_PUBLIC_BASE_URL}/submissions/{original_id})"
+                    )
+            logger.info(
+                f"duplicate detected for message {message.id}: {dup_lines}"
+            )
+            await asyncio.to_thread(
+                dao.record_event,
+                level="INFO",
+                category="submission.duplicate_rejected",
+                message=(
+                    f"rejected duplicate images from {message.author.display_name}: "
+                    f"{'; '.join(dup_lines)}"
+                ),
+                actor=author_id,
+                guild_id=guild_id,
+                context={
+                    "message_id": str(message.id),
+                    "duplicate_of": dup_map,
+                },
+            )
+            await message.reply(
+                f"<@{author_id}> that\u2019s a duplicate. "
+                + "\n".join(dup_lines)
+                + "\n-# If this is genuinely a different session, an admin "
+                "can override from the dashboard."
+            )
+            return
+
+        # Step 3 — no active events -> insert rejected placeholders, stay silent or riff
+        active_events = await asyncio.to_thread(
+            dao.list_active_events, guild_id
+        )
+        if not active_events:
+            for i, s in enumerate(saved):
+                suffix = f"_{i}" if len(saved) > 1 else ""
+                submission_id = await asyncio.to_thread(
+                    dao.insert_submission,
+                    guild_id=guild_id,
+                    event_id=None,
+                    discord_user_id=author_id,
+                    message_id=str(message.id) + suffix,
+                    channel_id=str(message.channel.id),
+                    posted_at=message.created_at.isoformat(),
+                    image_path=s["path"],
+                    raw_text=message.content or None,
+                    extracted_stats=None,
+                    status="rejected",
+                )
+                await asyncio.to_thread(
+                    dao.insert_submission_images,
+                    submission_id=submission_id,
+                    images=[(s["path"], s["hash"])],
+                )
             if runtime_config.reply_only_on_challenge_match(guild_id):
                 logger.info(
-                    f"silent: no active event for message {message.id}; "
-                    f"stored submission #{submission_id} rejected"
+                    f"silent: no active event for message {message.id}"
                 )
                 await asyncio.to_thread(
                     dao.record_event,
                     level="INFO",
                     category="submission.silent.no_event",
                     message=(
-                        f"image from {message.author.display_name} received but "
-                        f"no active event; stored submission #{submission_id}, no reply"
+                        f"image(s) from {message.author.display_name} received "
+                        f"but no active event; no reply"
                     ),
                     actor=author_id,
-                    context={"message_id": str(message.id), "submission_id": submission_id},
+                    guild_id=guild_id,
+                    context={"message_id": str(message.id)},
                 )
-            else:
-                async with message.channel.typing():
-                    await self._post_hardcore_riff(
-                        guild_id=guild_id,
-                        message=message,
-                        image_bytes=image_bytes,
-                        image_format=image_format,
-                        active_event=None,
-                        submission_id=submission_id,
-                        reason="no_event",
-                    )
+                return
+            # Fallback: hardcore riff on the first image
+            async with message.channel.typing():
+                riff_bytes, riff_fmt = _downsize_image(saved[0]["bytes"], saved[0]["format"])
+                await self._post_hardcore_riff(
+                    guild_id=guild_id,
+                    message=message,
+                    image_bytes=riff_bytes,
+                    image_format=riff_fmt,
+                    active_event=None,
+                    submission_id=0,
+                    reason="no_event",
+                )
             return
 
         primary_hint = active_events[0]
 
+        # Step 4 — one vision call for the whole batch
         async with message.channel.typing():
+            downsized: list[tuple[bytes, str]] = [
+                _downsize_image(s["bytes"], s["format"]) for s in saved
+            ]
             try:
-                stats = await asyncio.to_thread(
-                    vision.extract, image_bytes, image_format, primary_hint["prompt"]
+                batch = await asyncio.to_thread(
+                    vision.extract, downsized, primary_hint["prompt"]
                 )
             except Exception as e:
                 logger.error(traceback.format_exc())
-                logger.error(f"vision extraction failed for message {message.id}: {e}")
-                submission_id = await asyncio.to_thread(
-                    dao.insert_submission,
-                    guild_id=guild_id,
-                    event_id=None,
-                    discord_user_id=author_id,
-                    message_id=effective_message_id,
-                    channel_id=str(message.channel.id),
-                    posted_at=message.created_at.isoformat(),
-                    image_path=rel_image_path,
-                    raw_text=message.content or None,
-                    extracted_stats={
-                        "is_workout_screenshot": False,
-                        "notes": f"vision extraction failed: {e}",
-                        "confidence": 0.0,
-                    },
-                    status="rejected",
+                logger.error(
+                    f"vision extraction failed for message {message.id}: {e}"
                 )
-                if runtime_config.reply_only_on_challenge_match(guild_id):
-                    await asyncio.to_thread(
-                        dao.record_event,
-                        level="ERROR",
-                        category="submission.silent.vision_failed",
-                        message=(
-                            f"vision failed for message {message.id}: {e}; "
-                            f"stored submission #{submission_id}, no reply"
-                        ),
-                        actor=author_id,
-                        context={
-                            "message_id": str(message.id),
-                            "submission_id": submission_id,
-                            "image_path": rel_image_path,
-                        },
-                    )
-                else:
-                    await asyncio.to_thread(
-                        dao.record_event,
-                        level="ERROR",
-                        category="submission.riff.vision_failed_source",
-                        message=(
-                            f"vision failed for message {message.id}: {e}; "
-                            f"riff will still fire"
-                        ),
-                        actor=author_id,
-                        context={
-                            "message_id": str(message.id),
-                            "submission_id": submission_id,
-                        },
-                    )
-                    await self._post_hardcore_riff(
+                # One placeholder submission per image, all rejected
+                for i, s in enumerate(saved):
+                    suffix = f"_{i}" if len(saved) > 1 else ""
+                    sid = await asyncio.to_thread(
+                        dao.insert_submission,
                         guild_id=guild_id,
-                        message=message,
-                        image_bytes=image_bytes,
-                        image_format=image_format,
-                        active_event=primary_hint,
-                        submission_id=submission_id,
-                        reason="vision_failed",
+                        event_id=None,
+                        discord_user_id=author_id,
+                        message_id=str(message.id) + suffix,
+                        channel_id=str(message.channel.id),
+                        posted_at=message.created_at.isoformat(),
+                        image_path=s["path"],
+                        raw_text=message.content or None,
+                        extracted_stats={
+                            "is_workout_screenshot": False,
+                            "notes": f"vision extraction failed: {e}",
+                            "confidence": 0.0,
+                        },
+                        status="rejected",
                     )
+                    await asyncio.to_thread(
+                        dao.insert_submission_images,
+                        submission_id=sid,
+                        images=[(s["path"], s["hash"])],
+                    )
+                await asyncio.to_thread(
+                    dao.record_event,
+                    level="ERROR",
+                    category="submission.silent.vision_failed",
+                    message=f"vision failed for message {message.id}: {e}",
+                    actor=author_id,
+                    guild_id=guild_id,
+                    context={"message_id": str(message.id)},
+                )
                 return
 
-            # Always ask the router whether this workout actually fits any
-            # active event's prompt. The single-event case used to short-
-            # circuit here, but that path skipped the relevance check and
-            # let unrelated workouts (e.g. treadmill session in a leg-
-            # tucks challenge) get auto-attributed. The router already
-            # sees WORKOUT_DOMAIN_KNOWLEDGE and knows a specific-exercise
-            # challenge isn't satisfied by a session lacking that
-            # exercise.
-            matched_event_ids: list[int]
-            if not stats.is_workout_screenshot:
-                matched_event_ids = []
-            else:
+        # Step 5 — insert one submission per session, link images, route
+        num_images = len(saved)
+        session_records: list[dict] = []
+        for sidx, session in enumerate(batch.sessions):
+            # Which images belong to this session?
+            indices = list(session.image_indices)
+            # Defensive: filter out-of-range
+            indices = [i for i in indices if 0 <= i < num_images]
+            if not indices:
+                logger.warning(
+                    f"session {sidx} has no valid image_indices; skipping"
+                )
+                continue
+            session_images = [saved[i] for i in indices]
+
+            # Route
+            matched_event_ids: list[int] = []
+            if session.is_workout_screenshot:
                 try:
                     decision = await asyncio.to_thread(
                         router.route_submission,
-                        stats=stats.model_dump(),
+                        stats=session.model_dump(),
                         events=active_events,
                     )
                     matched_event_ids = decision.matched_event_ids
-                    logger.info(
-                        f"router matched {matched_event_ids} for message {message.id}"
-                    )
                     await asyncio.to_thread(
                         dao.record_event,
                         level="INFO",
                         category="router.decision",
                         message=(
-                            f"router matched {matched_event_ids} "
+                            f"session {sidx}: matched {matched_event_ids} "
                             f"({decision.reasoning})"
                         ),
                         actor="bot",
+                        guild_id=guild_id,
                         context={
                             "message_id": str(message.id),
+                            "session_index": sidx,
                             "matched_event_ids": matched_event_ids,
                             "reasoning": decision.reasoning,
-                            "active_event_ids": [int(e["id"]) for e in active_events],
                         },
                     )
                 except Exception as e:
                     logger.error(traceback.format_exc())
-                    logger.error(f"router failed for message {message.id}: {e}")
-                    # Fail-closed: if the router can't decide, treat it as
-                    # unmatched rather than fanning out to every active
-                    # event. Fanning out was the old behavior and directly
-                    # caused the leaderboard pollution bug on submission #18.
+                    logger.error(
+                        f"router failed for session {sidx} of message "
+                        f"{message.id}: {e}"
+                    )
                     matched_event_ids = []
                     await asyncio.to_thread(
                         dao.record_event,
                         level="ERROR",
                         category="router.failed",
-                        message=(
-                            f"router failed, treating as unmatched "
-                            f"(no attribution): {e}"
-                        ),
+                        message=f"router failed on session {sidx}: {e}",
                         actor="bot",
-                        context={"message_id": str(message.id)},
+                        guild_id=guild_id,
+                        context={
+                            "message_id": str(message.id),
+                            "session_index": sidx,
+                        },
                     )
 
-            recognized = stats.is_workout_screenshot and bool(matched_event_ids)
+            recognized = session.is_workout_screenshot and bool(matched_event_ids)
             primary_event_id = matched_event_ids[0] if matched_event_ids else None
-            submission_id = await asyncio.to_thread(
+
+            # Compute a unique message_id-per-submission (we still need this
+            # because the schema has UNIQUE(message_id)). One session per
+            # message uses the bare id; multi-session uses "<msgid>_s<sidx>".
+            per_sub_msg_id = str(message.id)
+            if len(batch.sessions) > 1:
+                per_sub_msg_id = f"{message.id}_s{sidx}"
+
+            status = "approved" if recognized else "rejected"
+            if batch.needs_clarification:
+                status = "pending"
+
+            sid = await asyncio.to_thread(
                 dao.insert_submission,
                 guild_id=guild_id,
                 event_id=primary_event_id,
                 discord_user_id=author_id,
-                message_id=effective_message_id,
+                message_id=per_sub_msg_id,
                 channel_id=str(message.channel.id),
                 posted_at=message.created_at.isoformat(),
-                image_path=rel_image_path,
+                image_path=session_images[0]["path"],  # primary image
                 raw_text=message.content or None,
-                extracted_stats=stats.model_dump(),
-                status="approved" if recognized else "rejected",
+                extracted_stats=session.model_dump(),
+                status=status,
             )
-            logger.info(
-                f"stored submission #{submission_id} "
-                f"status={'approved' if recognized else 'rejected'} "
-                f"for user {author_id}, matched_events={matched_event_ids}"
+            await asyncio.to_thread(
+                dao.insert_submission_images,
+                submission_id=sid,
+                images=[(img["path"], img["hash"]) for img in session_images],
             )
             for i, eid in enumerate(matched_event_ids):
                 await asyncio.to_thread(
                     dao.link_submission_to_event,
-                    submission_id=submission_id,
+                    submission_id=sid,
                     event_id=eid,
                     is_primary=(i == 0),
                 )
 
-            if not recognized:
-                reason = "not_workout" if not stats.is_workout_screenshot else "no_match"
-                if runtime_config.reply_only_on_challenge_match(guild_id):
-                    await asyncio.to_thread(
-                        dao.record_event,
-                        level="INFO",
-                        category=f"submission.silent.{reason}",
-                        message=(
-                            f"submission #{submission_id} silent ({reason})"
-                        ),
-                        actor=author_id,
-                        context={
-                            "message_id": str(message.id),
-                            "submission_id": submission_id,
-                            "is_workout_screenshot": stats.is_workout_screenshot,
-                            "confidence": stats.confidence,
-                            "workout_type": stats.workout_type,
-                            "notes": stats.notes,
-                        },
-                    )
-                else:
-                    await self._post_hardcore_riff(
-                        guild_id=guild_id,
-                        message=message,
-                        image_bytes=image_bytes,
-                        image_format=image_format,
-                        active_event=primary_hint,
-                        submission_id=submission_id,
-                        reason=reason,
-                    )
-                return None
+            session_records.append(
+                {
+                    "submission_id": sid,
+                    "session_index": sidx,
+                    "session": session,
+                    "matched_event_ids": matched_event_ids,
+                    "status": status,
+                    "recognized": recognized,
+                }
+            )
 
-            summary = _summarize_stats(stats)
-            matched_by_id = {int(e["id"]): e for e in active_events}
-            matched_events = [
-                matched_by_id[eid] for eid in matched_event_ids if eid in matched_by_id
-            ]
-
+        # If clarification is needed, post the question and skip the ack
+        if batch.needs_clarification and batch.clarification_question:
+            pending_ids = [r["submission_id"] for r in session_records]
+            clarification_msg = await message.reply(
+                f"<@{author_id}> {batch.clarification_question}\n"
+                f"-# Reply to this message to clarify and I\u2019ll score it. "
+                f"(submissions #{', #'.join(str(s) for s in pending_ids)})"
+            )
+            # Store the message id on every pending submission so any of them
+            # can be found by the reply handler
+            for sid in pending_ids:
+                await asyncio.to_thread(
+                    dao.set_clarification_message_id,
+                    sid,
+                    str(clarification_msg.id),
+                )
             await asyncio.to_thread(
                 dao.record_event,
                 level="INFO",
-                category="submission.approved",
-                message=f"submission #{submission_id} auto-approved for {author_id}: {summary}",
+                category="submission.needs_clarification",
+                message=(
+                    f"batch needs clarification: {batch.clarification_question}"
+                ),
                 actor=author_id,
+                guild_id=guild_id,
                 context={
                     "message_id": str(message.id),
-                    "submission_id": submission_id,
-                    "matched_event_ids": matched_event_ids,
-                    "workout_type": stats.workout_type,
-                    "confidence": stats.confidence,
+                    "submission_ids": pending_ids,
+                    "question": batch.clarification_question,
+                    "reasoning": batch.reasoning,
                 },
             )
+            return
 
-            primary_event = matched_events[0]
+        # Step 6 — consolidated voice ack for approved sessions
+        approved = [r for r in session_records if r["recognized"]]
+        if not approved:
+            if runtime_config.reply_only_on_challenge_match(guild_id):
+                await asyncio.to_thread(
+                    dao.record_event,
+                    level="INFO",
+                    category="submission.silent.no_match",
+                    message=(
+                        f"no session in batch matched; "
+                        f"reasoning={batch.reasoning!r}"
+                    ),
+                    actor=author_id,
+                    guild_id=guild_id,
+                    context={
+                        "message_id": str(message.id),
+                        "submission_ids": [r["submission_id"] for r in session_records],
+                    },
+                )
+                return
+            # Riff on the first image
+            async with message.channel.typing():
+                riff_bytes, riff_fmt = _downsize_image(saved[0]["bytes"], saved[0]["format"])
+                await self._post_hardcore_riff(
+                    guild_id=guild_id,
+                    message=message,
+                    image_bytes=riff_bytes,
+                    image_format=riff_fmt,
+                    active_event=primary_hint,
+                    submission_id=session_records[0]["submission_id"]
+                    if session_records
+                    else 0,
+                    reason="no_match",
+                )
+            return
+
+        # Voice line: use the first approved session\u2019s stats, or combine
+        # for multi-session batches
+        matched_by_id = {int(e["id"]): e for e in active_events}
+        if len(approved) == 1:
+            r = approved[0]
+            stats_for_voice = r["session"]
+            primary_event = matched_by_id.get(
+                r["matched_event_ids"][0], active_events[0]
+            )
+        else:
+            total_stats: dict[str, float] = {}
+            for r in approved:
+                for key in (
+                    "elevation_gain_feet",
+                    "duration_seconds",
+                    "distance_miles",
+                    "calories",
+                    "reps",
+                    "volume_lb",
+                ):
+                    val = getattr(r["session"], key, None)
+                    if val:
+                        total_stats[key] = total_stats.get(key, 0.0) + float(val)
+            base = approved[0]["session"].model_dump()
+            stats_for_voice = WorkoutStats(**{**base, **total_stats})
+            primary_event = matched_by_id.get(
+                approved[0]["matched_event_ids"][0], active_events[0]
+            )
+
+        async with message.channel.typing():
             voice_line = await asyncio.to_thread(
                 voice.acknowledge_workout,
                 guild_id=guild_id,
                 user_display_name=message.author.display_name,
                 event_name=primary_event["name"],
                 event_prompt=primary_event["prompt"],
-                stats=stats.model_dump(),
+                stats=stats_for_voice.model_dump(),
             )
 
-        return {
-            "recognized": True,
-            "submission_id": submission_id,
-            "summary": summary,
-            "voice_line": voice_line,
-            "stats": stats.model_dump(),
-            "matched_event_ids": matched_event_ids,
-            "event_name": primary_event["name"],
-            "primary_event": primary_event,
-        }
+        summaries = [_summarize_stats(r["session"]) for r in approved]
+        sub_ids = [r["submission_id"] for r in approved]
+
+        if len(approved) == 1:
+            footer = summaries[0] + f" \u00b7 submission #{sub_ids[0]}"
+        else:
+            footer = (
+                f"{len(approved)} sessions logged \u00b7 "
+                f"submissions #{', #'.join(str(s) for s in sub_ids)}"
+            )
+
+        await message.reply(f"<@{author_id}> {voice_line}\n-# {footer}")
+
+        await asyncio.to_thread(
+            dao.record_event,
+            level="INFO",
+            category="submission.approved",
+            message=(
+                f"batch approved: {len(approved)}/{len(session_records)} session(s) "
+                f"matched active events"
+            ),
+            actor=author_id,
+            guild_id=guild_id,
+            context={
+                "message_id": str(message.id),
+                "submission_ids": sub_ids,
+                "reasoning": batch.reasoning,
+            },
+        )
+
+    async def _handle_clarification_reply(
+        self, guild_id: str, message: discord.Message, pending_subs: list[dict]
+    ) -> None:
+        """Re-process a batch after the user answers the clarification question.
+
+        Re-runs vision on the original images with the user\u2019s answer
+        appended to the event prompt, then finalizes every pending
+        submission in the batch. Sessions may resplit — pending rows may
+        end up approved, rejected, or (rarely) stay pending if vision
+        still can\u2019t decide.
+        """
+        author_id = str(message.author.id)
+        clarification_text = message.content.strip()
+
+        # Collect all images across the pending submissions in order
+        image_records: list[dict] = []
+        seen_paths: set[str] = set()
+        for sub in pending_subs:
+            for img in dao.get_submission_images(sub["id"]):
+                if img["image_path"] in seen_paths:
+                    continue
+                seen_paths.add(img["image_path"])
+                image_records.append(img)
+
+        if not image_records:
+            await message.reply(
+                "I couldn\u2019t find the original images for that batch. "
+                "An admin can review from the dashboard."
+            )
+            return
+
+        # Read the images from disk
+        images: list[tuple[bytes, str]] = []
+        for img in image_records:
+            full_path = config.REPO_ROOT / img["image_path"]
+            if not full_path.exists():
+                await message.reply(
+                    "One of the original screenshots is missing from disk. "
+                    "An admin can review from the dashboard."
+                )
+                return
+            image_bytes = full_path.read_bytes()
+            ext = full_path.suffix.lower()
+            fmt_map = {
+                ".jpg": "jpeg",
+                ".jpeg": "jpeg",
+                ".png": "png",
+                ".gif": "gif",
+                ".webp": "webp",
+            }
+            fmt = fmt_map.get(ext, "jpeg")
+            image_bytes, fmt = _downsize_image(image_bytes, fmt)
+            images.append((image_bytes, fmt))
+
+        active_events = await asyncio.to_thread(dao.list_active_events, guild_id)
+        if not active_events:
+            await message.reply(
+                "There\u2019s no active challenge right now. Your submissions "
+                "stay pending."
+            )
+            return
+
+        primary_hint = active_events[0]
+        augmented_prompt = (
+            f"{primary_hint['prompt']}\n\n"
+            f"USER CLARIFICATION: The user was asked about ambiguity in these "
+            f"screenshots and replied: \"{clarification_text}\"\n"
+            f"Use this information to resolve the ambiguity and split the images "
+            f"into sessions accordingly. Do NOT set needs_clarification=true — "
+            f"the user has already answered."
+        )
+
+        async with message.channel.typing():
+            try:
+                batch = await asyncio.to_thread(
+                    vision.extract, images, augmented_prompt
+                )
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                logger.error(
+                    f"re-extraction failed for clarification reply {message.id}: {e}"
+                )
+                await message.reply(
+                    "Something went wrong re-processing the screenshots. "
+                    "An admin can review from the dashboard."
+                )
+                return
+
+            # Finalize: we now have N pending submissions and vision returned
+            # M sessions. We update up to min(N, M) submissions in place and
+            # reject any extras.
+            num_images = len(image_records)
+            finalized: list[dict] = []
+            for sidx, session in enumerate(batch.sessions):
+                if sidx >= len(pending_subs):
+                    # Vision produced more sessions than we have pending rows
+                    # (rare) — log and stop.
+                    logger.warning(
+                        f"clarification produced {len(batch.sessions)} sessions "
+                        f"but only {len(pending_subs)} pending submissions exist; "
+                        f"session {sidx} dropped"
+                    )
+                    break
+
+                sub = pending_subs[sidx]
+                sid = sub["id"]
+
+                matched_event_ids: list[int] = []
+                if session.is_workout_screenshot:
+                    try:
+                        decision = await asyncio.to_thread(
+                            router.route_submission,
+                            stats=session.model_dump(),
+                            events=active_events,
+                        )
+                        matched_event_ids = decision.matched_event_ids
+                    except Exception as e:
+                        logger.error(
+                            f"router failed on clarification re-run for #{sid}: {e}"
+                        )
+
+                recognized = session.is_workout_screenshot and bool(
+                    matched_event_ids
+                )
+                new_status = "approved" if recognized else "rejected"
+                primary_event_id = (
+                    matched_event_ids[0] if matched_event_ids else None
+                )
+
+                await asyncio.to_thread(
+                    dao.update_submission_after_clarification,
+                    submission_id=sid,
+                    status=new_status,
+                    event_id=primary_event_id,
+                    extracted_stats=session.model_dump(),
+                    reviewed_by="bot",
+                )
+                for i, eid in enumerate(matched_event_ids):
+                    await asyncio.to_thread(
+                        dao.link_submission_to_event,
+                        submission_id=sid,
+                        event_id=eid,
+                        is_primary=(i == 0),
+                    )
+                finalized.append(
+                    {
+                        "submission_id": sid,
+                        "session": session,
+                        "matched_event_ids": matched_event_ids,
+                        "status": new_status,
+                        "recognized": recognized,
+                    }
+                )
+
+            # If vision produced fewer sessions than pending rows, reject
+            # the extras.
+            for extra in pending_subs[len(batch.sessions):]:
+                await asyncio.to_thread(
+                    dao.update_submission_after_clarification,
+                    submission_id=extra["id"],
+                    status="rejected",
+                    event_id=None,
+                    extracted_stats={
+                        "is_workout_screenshot": False,
+                        "notes": "merged into another session after clarification",
+                        "confidence": 0.0,
+                    },
+                    reviewed_by="bot",
+                )
+
+            await asyncio.to_thread(
+                dao.record_event,
+                level="INFO",
+                category="submission.clarification_resolved",
+                message=(
+                    f"batch resolved after clarification into "
+                    f"{len(batch.sessions)} session(s)"
+                ),
+                actor=author_id,
+                guild_id=guild_id,
+                context={
+                    "clarification": clarification_text[:200],
+                    "submission_ids": [f["submission_id"] for f in finalized],
+                    "outcomes": [f["status"] for f in finalized],
+                    "reasoning": batch.reasoning,
+                },
+            )
+
+            approved = [f for f in finalized if f["recognized"]]
+            if not approved:
+                await message.reply(
+                    "Thanks for clarifying! After re-checking, this doesn\u2019t "
+                    "match an active challenge. An admin can review if needed."
+                )
+                return
+
+            matched_by_id = {int(e["id"]): e for e in active_events}
+            if len(approved) == 1:
+                stats_for_voice = approved[0]["session"]
+                primary_event = matched_by_id.get(
+                    approved[0]["matched_event_ids"][0], active_events[0]
+                )
+            else:
+                total_stats: dict[str, float] = {}
+                for r in approved:
+                    for key in (
+                        "elevation_gain_feet",
+                        "duration_seconds",
+                        "distance_miles",
+                        "calories",
+                        "reps",
+                        "volume_lb",
+                    ):
+                        val = getattr(r["session"], key, None)
+                        if val:
+                            total_stats[key] = total_stats.get(key, 0.0) + float(val)
+                base = approved[0]["session"].model_dump()
+                stats_for_voice = WorkoutStats(**{**base, **total_stats})
+                primary_event = matched_by_id.get(
+                    approved[0]["matched_event_ids"][0], active_events[0]
+                )
+
+            voice_line = await asyncio.to_thread(
+                voice.acknowledge_workout,
+                guild_id=guild_id,
+                user_display_name=message.author.display_name,
+                event_name=primary_event["name"],
+                event_prompt=primary_event["prompt"],
+                stats=stats_for_voice.model_dump(),
+            )
+            sub_ids = [r["submission_id"] for r in approved]
+            summaries = [_summarize_stats(r["session"]) for r in approved]
+            if len(approved) == 1:
+                footer = summaries[0] + f" \u00b7 submission #{sub_ids[0]}"
+            else:
+                footer = (
+                    f"{len(approved)} sessions logged \u00b7 "
+                    f"submissions #{', #'.join(str(s) for s in sub_ids)}"
+                )
+            await message.reply(f"<@{author_id}> {voice_line}\n-# {footer}")
+
+
 
 
 def run() -> None:

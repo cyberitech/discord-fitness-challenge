@@ -61,6 +61,41 @@ def _user_cell(row: dict) -> str:
     )
 
 
+def _images_gallery(submission_id: int) -> str:
+    """Render every image linked to a submission as a horizontal gallery.
+
+    Falls back to submissions.image_path for pre-migration rows that
+    never got a ``submission_images`` entry with a real path.
+    """
+    images = dao.get_submission_images(submission_id)
+    if not images:
+        return ""
+
+    thumbs: list[str] = []
+    for img in images:
+        # Legacy backfilled rows may have an empty hash; the URL still
+        # works because we serve by position.
+        img_url = f"/media/submissions/{submission_id}/image?position={img['position']}"
+        thumbs.append(
+            f"""
+<div style="position:relative;display:inline-block;">
+  <img src="{img_url}"
+       style="max-height:340px;max-width:100%;border-radius:6px;display:block;">
+  <a href="{img_url}" target="_blank" title="Open full size"
+     style="position:absolute;top:0.5rem;right:0.5rem;
+            background:rgba(0,0,0,0.55);color:white;padding:0.25rem 0.6rem;
+            border-radius:4px;text-decoration:none;font-size:0.85rem;">⤢ expand</a>
+</div>
+"""
+        )
+
+    return f"""
+<div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem;">
+  {''.join(thumbs)}
+</div>
+"""
+
+
 def _detail_block(row: dict, submission_id: int) -> str:
     """Inline detail block shown when a row is expanded."""
     stats_json = row.get("extracted_stats")
@@ -71,19 +106,7 @@ def _detail_block(row: dict, submission_id: int) -> str:
         except json.JSONDecodeError:
             stats_pretty = stats_json
 
-    image_block = ""
-    if row.get("image_path"):
-        img_url = f"/media/submissions/{submission_id}/image"
-        image_block = f"""
-<div style="position:relative;display:inline-block;margin-bottom:1rem;max-width:100%;">
-  <img src="{img_url}"
-       style="max-height:340px;max-width:100%;border-radius:6px;display:block;">
-  <a href="{img_url}" target="_blank" title="Open full size"
-     style="position:absolute;top:0.5rem;right:0.5rem;
-            background:rgba(0,0,0,0.55);color:white;padding:0.25rem 0.6rem;
-            border-radius:4px;text-decoration:none;font-size:0.85rem;">⤢ expand</a>
-</div>
-"""
+    image_block = _images_gallery(submission_id)
 
     review_meta = ""
     if row.get("reviewed_by"):
@@ -152,15 +175,23 @@ async def list_submissions_page(
     request: Request,
     status: str | None = None,
     event_id: int | None = None,
+    include_non_workout: int = 0,
 ) -> HTMLResponse | RedirectResponse:
     admin = admin_from_session(request)
     if admin is None:
         return RedirectResponse("/", status_code=307)
 
-    rows = dao.list_submissions(status=status, event_id=event_id)
+    rows = dao.list_submissions(
+        status=status,
+        event_id=event_id,
+        include_non_workout=bool(include_non_workout),
+    )
     events = dao.list_events(admin["current_guild_id"])
 
     def filter_link(label: str, params: dict[str, str], active: bool) -> str:
+        # Preserve the include_non_workout toggle across status filters
+        if include_non_workout and "include_non_workout" not in params:
+            params = {**params, "include_non_workout": "1"}
         qs = "&".join(f"{k}={v}" for k, v in params.items() if v)
         href = f"/submissions?{qs}" if qs else "/submissions"
         cls = "btn" if active else "btn secondary"
@@ -174,6 +205,26 @@ async def list_submissions_page(
             filter_link("Pending", {"status": "pending"}, status == "pending"),
         ]
     )
+
+    # Non-workout toggle. Preserve current status when flipping the switch.
+    toggle_params: dict[str, str] = {}
+    if status:
+        toggle_params["status"] = status
+    if event_id:
+        toggle_params["event_id"] = str(event_id)
+    if not include_non_workout:
+        toggle_params["include_non_workout"] = "1"
+        toggle_label = "Show non-workouts"
+    else:
+        toggle_label = "Hide non-workouts"
+    toggle_qs = "&".join(f"{k}={v}" for k, v in toggle_params.items())
+    toggle_href = f"/submissions?{toggle_qs}" if toggle_qs else "/submissions"
+    toggle_cls = "btn" if include_non_workout else "btn secondary"
+    non_workout_toggle = (
+        f'<a class="{toggle_cls}" href="{escape(toggle_href)}" '
+        f'style="margin-left:0.5rem;">{escape(toggle_label)}</a>'
+    )
+    status_filters += non_workout_toggle
 
     event_options = ['<option value="">All events</option>']
     for e in events:
@@ -278,14 +329,8 @@ async def submission_detail_page(
             f'at {escape(row["reviewed_at"])}</p>'
         )
 
-    image_block = ""
-    if row["image_path"]:
-        image_block = f"""
-<div class="card">
-  <img src="/media/submissions/{submission_id}/image"
-       style="max-width:100%;border-radius:6px;display:block;">
-</div>
-"""
+    gallery = _images_gallery(submission_id)
+    image_block = f'<div class="card">{gallery}</div>' if gallery else ""
 
     event_link = (
         f'<a href="/events/{row["event_id"]}">#{row["event_id"]} — {escape(row["event_name"] or "?")}</a>'
@@ -366,22 +411,45 @@ async def flip_submission_status(
 
 
 @router.get("/media/submissions/{submission_id}/image")
-async def submission_image(request: Request, submission_id: int) -> FileResponse:
+async def submission_image(
+    request: Request, submission_id: int, position: int = 0
+) -> FileResponse:
+    """Serve one image belonging to a submission.
+
+    ``position`` selects which image within the submission. Defaults to
+    0 (the first / primary image). Legacy pre-migration submissions
+    only have position 0, populated from the ``submissions.image_path``
+    column via the backfill in migration 013.
+    """
     admin = admin_from_session(request)
     if admin is None:
         raise HTTPException(status_code=403, detail="Not authenticated")
 
-    row = dao.get_submission(submission_id)
-    if row is None or not row["image_path"]:
+    # Prefer submission_images row for the given position
+    images = dao.get_submission_images(submission_id)
+    image_path: str | None = None
+    for img in images:
+        if img["position"] == position:
+            image_path = img["image_path"]
+            break
+
+    # Fallback to legacy submissions.image_path when position=0 and
+    # no submission_images row exists (shouldn't happen post-migration
+    # but keep the guard).
+    if image_path is None and position == 0:
+        row = dao.get_submission(submission_id)
+        if row is not None:
+            image_path = row.get("image_path")
+
+    if not image_path:
         raise HTTPException(status_code=404, detail="No image")
 
-    stored = Path(row["image_path"])
+    stored = Path(image_path)
     if stored.is_absolute():
         abs_path = stored
     else:
         abs_path = config.REPO_ROOT / stored
 
-    # Belt-and-suspenders check — file must be under the screenshots dir.
     screenshots_root = config.FCB_SCREENSHOTS_DIR.resolve()
     try:
         abs_path.resolve().relative_to(screenshots_root)

@@ -225,6 +225,127 @@ def link_submission_to_event(
         conn.close()
 
 
+def insert_submission_images(
+    *,
+    submission_id: int,
+    images: list[tuple[str, str]],
+) -> None:
+    """Attach a list of images to a submission.
+
+    Args:
+        submission_id: the parent submission id.
+        images: list of ``(image_path, image_hash)`` tuples. Order in
+            the list defines the ``position`` column (0-based).
+
+    Idempotent by ``(submission_id, position)``: re-inserting the same
+    position for the same submission is a no-op via UNIQUE constraint.
+    """
+    conn = connect()
+    try:
+        for position, (image_path, image_hash) in enumerate(images):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO submission_images
+                    (submission_id, image_path, image_hash, position)
+                VALUES (?, ?, ?, ?)
+                """,
+                (submission_id, image_path, image_hash, position),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_submission_images(submission_id: int) -> list[dict[str, Any]]:
+    """Return the image rows for a submission, ordered by position."""
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, submission_id, image_path, image_hash, position
+              FROM submission_images
+             WHERE submission_id = ?
+             ORDER BY position
+            """,
+            (submission_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def find_duplicate_hashes(hashes: list[str]) -> dict[str, int]:
+    """Look up which of the given hashes already exist on an APPROVED submission.
+
+    Empty strings (historical backfill placeholders) are ignored — they
+    can never match a real incoming hash.
+
+    Returns a mapping from matched hash → submission_id of the earliest
+    approved submission carrying that hash. Hashes with no match are
+    absent from the returned dict.
+    """
+    real_hashes = [h for h in hashes if h]
+    if not real_hashes:
+        return {}
+    placeholders = ",".join("?" for _ in real_hashes)
+    conn = connect()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT si.image_hash AS hash, MIN(si.submission_id) AS submission_id
+              FROM submission_images si
+              JOIN submissions s ON s.id = si.submission_id
+             WHERE si.image_hash IN ({placeholders})
+               AND si.image_hash != ''
+               AND s.status = 'approved'
+             GROUP BY si.image_hash
+            """,
+            real_hashes,
+        ).fetchall()
+        return {r["hash"]: r["submission_id"] for r in rows}
+    finally:
+        conn.close()
+
+
+def set_clarification_message_id(submission_id: int, message_id: str) -> None:
+    """Store the bot's clarification-question message id on a submission."""
+    conn = connect()
+    try:
+        conn.execute(
+            "UPDATE submissions SET clarification_message_id = ? WHERE id = ?",
+            (message_id, submission_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_submissions_by_clarification_message(
+    message_id: str,
+) -> list[dict[str, Any]]:
+    """Return every pending submission tied to a bot clarification message.
+
+    A single clarification message may cover multiple submissions when
+    the batch resolved to more than one session, so we return a list.
+    Only ``pending`` submissions are returned — once resolved, the
+    clarification_message_id stays on the row for audit but the query
+    filter drops it.
+    """
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM submissions
+             WHERE clarification_message_id = ?
+               AND status = 'pending'
+            """,
+            (message_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def insert_submission(
     *,
     guild_id: str,
@@ -464,6 +585,7 @@ def list_submissions(
     guild_id: str | None = None,
     event_id: int | None = None,
     status: str | None = None,
+    include_non_workout: bool = False,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     """Recent submissions joined with user + event context.
@@ -472,6 +594,11 @@ def list_submissions(
     When ``event_id`` is provided, filter through the many-to-many
     ``submission_events`` junction so submissions attributed to that
     event (primary OR secondary) are returned.
+
+    ``include_non_workout`` defaults to False, hiding submissions whose
+    vision extraction explicitly flagged them as
+    ``is_workout_screenshot=false`` (body pics, memes, food photos,
+    etc.). Set True to include them for admin audit.
     """
     where: list[str] = []
     params: list[Any] = []
@@ -488,6 +615,13 @@ def list_submissions(
             raise ValueError(f"invalid status {status!r}")
         where.append("s.status = ?")
         params.append(status)
+    if not include_non_workout:
+        # Hide rows where vision explicitly said this is not a workout.
+        # Rows with NULL extracted_stats or a missing key stay visible —
+        # only the definitively-not-workout images get filtered out.
+        where.append(
+            "COALESCE(json_extract(s.extracted_stats, '$.is_workout_screenshot'), 1) = 1"
+        )
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     params.append(limit)
 
@@ -584,6 +718,46 @@ def update_submission_status(
              WHERE id = ?
             """,
             (status, reviewed_by, submission_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            raise LookupError(f"submission {submission_id} not found")
+    finally:
+        conn.close()
+
+
+def update_submission_after_clarification(
+    submission_id: int,
+    *,
+    status: str,
+    event_id: int | None,
+    extracted_stats: Mapping[str, Any],
+    reviewed_by: str = "bot",
+) -> None:
+    """Finalize a pending submission after clarification.
+
+    Updates status, event_id (may change based on new understanding),
+    and extracted_stats (may change if vision re-interpreted the batch).
+    Marks reviewed_at.
+    """
+    if status not in ("pending", "approved", "rejected"):
+        raise ValueError(f"invalid status {status!r}")
+    conn = connect()
+    try:
+        cur = conn.execute(
+            """
+            UPDATE submissions
+               SET status = ?, event_id = ?, extracted_stats = ?,
+                   reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+             WHERE id = ?
+            """,
+            (
+                status,
+                event_id,
+                json.dumps(extracted_stats),
+                reviewed_by,
+                submission_id,
+            ),
         )
         conn.commit()
         if cur.rowcount == 0:

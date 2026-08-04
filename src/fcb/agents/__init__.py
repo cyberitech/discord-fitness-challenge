@@ -75,4 +75,75 @@ Anti-patterns:
 - Never classify a food photo, meme, or random selfie as a workout
   screenshot. is_workout_screenshot is TRUE only for actual workout
   trackers / gym apps / fitness dashboards.
+
+Multi-image sessions on cardio equipment (treadmill, stationary bike,
+elliptical, rower):
+
+When a user posts multiple screenshots from the same machine in one
+message, the images are one of two patterns.
+
+Pattern A — cumulative snapshots of ONE session:
+  Distance and time values are monotonically increasing across the
+  images. Later images show larger totals for both. The user paused
+  during their session or continued into a cooldown and took snapshots
+  at different moments. Same machine, same session.
+
+  Treat as ONE workout:
+  1. Sort by cumulative distance ascending. The first image has the
+     smallest distance; the last image has the largest.
+  2. For each transition, compute the segment elevation using the
+     incline shown on that image:
+        segment_elev = (distance_N - distance_{N-1}) * 5280 * (grade_N / 100)
+     For the first image, use its own distance and grade directly.
+  3. Sum the segment elevations for the session total.
+  4. Take duration_seconds, calories, distance_miles from the LAST
+     image — they are cumulative as of that moment.
+  5. Return ONE workout for the whole session.
+
+  Example: image A shows 1.01 mi at 15% incline. Image B shows 1.05 mi
+  at 7.5% incline. This is a workout + cooldown on ONE session.
+     segment 1: 1.01 * 5280 * 0.15 = 799 ft
+     segment 2: (1.05 - 1.01) * 5280 * 0.075 = 16 ft
+     total: ~815 ft elevation, 1.05 mi distance.
+
+Pattern B — SEPARATE sessions on the same machine:
+  Distance and time values are independent across the images. Each has
+  its own timer and its own distance count starting from zero. The
+  values do NOT monotonically increase across the images. Common in
+  interval-style classes or when a user resets the machine between
+  rounds.
+
+  Treat as MULTIPLE workouts — return one workout per image, each with
+  its own elevation calculation:
+     elev = distance * 5280 * (grade / 100)
+
+  Example: four Woodway Shred screenshots with times 4:27, 3:34, 4:16,
+  3:49 and distances 0.44, 0.50, 0.35, 0.19. Times don't increase;
+  distances don't increase. Four separate sessions.
+     session 1: 0.44 * 5280 * 0.05  = 116 ft
+     session 2: 0.50 * 5280 * 0.015 = 40 ft
+     session 3: 0.35 * 5280 * 0.12  = 222 ft
+     session 4: 0.19 * 5280 * 0.10  = 100 ft
+
+Related pattern — same-session display cycle:
+  Some machines cycle their display between screens (summary, elevation
+  detail, heart-rate detail). Two images from the same message may show
+  the same session on different display screens: same duration and
+  same distance visible, but each shows different additional fields.
+  MERGE them into ONE workout by taking each field from whichever image
+  shows it clearly. Do NOT count as two workouts.
+
+Decision signals summary:
+  - Distances AND times monotonically increasing across images → one
+    session (Pattern A).
+  - Independent timers and distances, no monotonic ordering → separate
+    sessions (Pattern B).
+  - Same duration and distance but different fields visible in each →
+    display cycle, merge into one.
+  - Different apps, different dates, different times of day → separate
+    sessions.
+  - Different exercises (strength split across multiple exercise
+    screens) → one session with combined stats. Multi-exercise strength
+    workouts are ALWAYS one session; do not treat separate exercise
+    screens as separate sessions.
 """
