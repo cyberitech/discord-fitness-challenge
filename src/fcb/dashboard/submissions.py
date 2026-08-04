@@ -13,8 +13,10 @@ traversal from outside is impossible.
 
 import json
 import logging
+from datetime import datetime
 from html import escape
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -24,6 +26,29 @@ from fcb.dashboard.ui import admin_from_session, page
 from fcb.db import dao
 
 logger = logging.getLogger(__name__)
+
+_PST = ZoneInfo("America/Los_Angeles")
+
+
+def _format_posted_at_pst(posted_at: str | None) -> str:
+    """Format a UTC ISO timestamp as Pacific time for display.
+
+    ``posted_at`` in the DB is stored as ISO 8601 UTC (with or without
+    a trailing offset). Handles both forms. Returns an empty string on
+    parse failure rather than blowing up the whole row.
+    """
+    if not posted_at:
+        return ""
+    try:
+        # Python's fromisoformat handles the "+00:00" form directly.
+        # Naive strings are treated as UTC.
+        dt = datetime.fromisoformat(posted_at)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        pst = dt.astimezone(_PST)
+        return pst.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except ValueError:
+        return posted_at
 
 router = APIRouter(tags=["submissions"])
 
@@ -130,7 +155,10 @@ def _detail_block(row: dict, submission_id: int) -> str:
     return f"""
 <div style="padding:0.5rem 0 0.25rem;">
   {image_block}
-  <p class="muted">Posted: {escape(row['posted_at'])}</p>
+  <p class="muted">
+    Posted: {escape(_format_posted_at_pst(row.get('posted_at')))}
+    &middot; Message ID: <code>{escape(row.get('message_id') or '')}</code>
+  </p>
   <h3 style="margin:1rem 0 0.5rem;">Extracted stats</h3>
   <pre style="background:var(--panel-2);padding:1rem;border-radius:6px;
               overflow-x:auto;white-space:pre-wrap;margin:0;">{escape(stats_pretty) or '(none)'}</pre>
@@ -235,7 +263,7 @@ async def list_submissions_page(
 
     if not rows:
         body_rows = (
-            '<tr><td colspan="6" class="muted" style="text-align:center;padding:2rem;">'
+            '<tr><td colspan="7" class="muted" style="text-align:center;padding:2rem;">'
             "No submissions match this filter."
             "</td></tr>"
         )
@@ -247,6 +275,7 @@ async def list_submissions_page(
                 if r["event_id"]
                 else '<span class="muted">—</span>'
             )
+            posted_pst = _format_posted_at_pst(r.get("posted_at"))
             body_rows += f"""
 <tr class="sub-row" onclick="toggleSubRow(this)" style="cursor:pointer;">
   <td class="chev" style="width:1.5rem;color:var(--muted);">▸</td>
@@ -255,9 +284,10 @@ async def list_submissions_page(
   <td>{event_link}</td>
   <td>{_stats_summary(r['extracted_stats'])}</td>
   <td>{_STATUS_TAGS.get(r['status'], r['status'])}</td>
+  <td class="muted" style="white-space:nowrap;font-size:0.85rem;">{escape(posted_pst)}</td>
 </tr>
 <tr class="sub-detail" hidden>
-  <td colspan="6" style="background:#0b1220;">
+  <td colspan="7" style="background:#0b1220;">
     {_detail_block(r, r['id'])}
   </td>
 </tr>"""
@@ -277,7 +307,7 @@ async def list_submissions_page(
     </form>
   </div>
   <table>
-    <tr><th></th><th></th><th>User</th><th>Event</th><th>Stats</th><th>Status</th></tr>
+    <tr><th></th><th></th><th>User</th><th>Event</th><th>Stats</th><th>Status</th><th>Posted (PST)</th></tr>
     {body_rows}
   </table>
 </div>
@@ -357,7 +387,7 @@ async def submission_detail_page(
     <div>{_STATUS_TAGS.get(row['status'], row['status'])}</div>
   </div>
   <p class="muted" style="margin-top:0.75rem;">
-    Event: {event_link} · Posted: {escape(row['posted_at'])}
+    Event: {event_link} · Posted: {escape(_format_posted_at_pst(row.get('posted_at')))} · Message ID: <code>{escape(row.get('message_id') or '')}</code>
   </p>
 </div>
 
