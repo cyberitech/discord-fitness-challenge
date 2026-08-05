@@ -120,12 +120,19 @@ When `bot.reply_only_on_challenge_match = false`: every non-recognized
 image gets a `voice.hardcore_riff` reply instead. The riff sends the
 raw image to Bedrock through its own multimodal call so it can
 reference specifics visible in the image (numbers on a lab chart,
-food on a plate, whatever) and ties them back to the user's
-fitness/health arc in a driving, motivating tone. The riff prompt
-explicitly permits OTC-supplement / diet / sleep / hydration
-suggestions (normal gym-friend advice) and prohibits medical
-diagnoses, prescription-med recommendations, and refusal
-disclaimers. Categorized as `submission.riff.no_event`,
+food on a plate, whatever) and reacts to what the user shared on its
+own terms. The riff prompt explicitly permits OTC-supplement / diet
+/ sleep / hydration commentary when the image is genuinely about
+that (a bloodwork chart, gym gear, a meal photo) and prohibits
+medical diagnoses, prescription-med recommendations, and refusal
+disclaimers. The riff MUST NOT redirect the reply to any active
+challenge or tell the user to log a workout — that's forced-pivot
+behavior the community has explicitly rejected. `voice.hardcore_riff`
+therefore does NOT receive `active_event_name` / `active_event_prompt`
+in its system prompt (the injection was removed); the same holds for
+`voice.describe_publicly`, whose "Describe" context-menu output stays
+reactive to the image rather than being pulled toward whatever is
+running. Categorized as `submission.riff.no_event`,
 `submission.riff.vision_failed`, `submission.riff.not_workout`, or
 `submission.riff.no_match` in `bot_events`. Submissions still
 persist to the DB the same way as the silent path.
@@ -308,12 +315,21 @@ successful OAuth callback and on every authenticated page load.
 Deterministic logic stays deterministic: SQL writes, "did user X post in
 the last N days," leaderboards. Strands agents handle the fuzzy parts:
 
-| Agent          | Input                        | Output                        |
-|----------------|------------------------------|-------------------------------|
-| `vision`       | image bytes + event prompt   | structured stats JSON         |
-| `classify`     | message text + attachments   | is-this-a-workout-update flag |
-| `voice`        | context (user, event, state) | reply / nag / hype text       |
-| `router`       | extracted stats + active events | ordered list of matched event IDs |
+| Agent          | Input                                      | Output                        |
+|----------------|--------------------------------------------|-------------------------------|
+| `vision`       | image bytes + event prompt + optional caption | structured stats JSON      |
+| `classify`     | message text + attachments                 | is-this-a-workout-update flag |
+| `voice`        | context (user, event, state)               | reply / nag / hype text       |
+| `router`       | extracted stats + active events            | ordered list of matched event IDs |
+
+Vision consumes the user's message caption (`message.content`) alongside
+the images. When a caption states a number the image doesn't show
+(e.g. "incline 6%" or "Effort is 6.5%" on an Apple Fitness Indoor Run
+that hides incline), vision treats it as authoritative user-supplied
+input and fills the missing field instead of falling through to the
+clarification-question path. A clearly-visible number in the image
+still wins over a contradicting caption. Rules live in the "User
+caption" section of `WORKOUT_DOMAIN_KNOWLEDGE`.
 
 All four share one Bedrock model client. See `bedrock.md`. The router
 fires on every image that vision classifies as a workout, regardless
@@ -338,6 +354,17 @@ It covers:
   bar is NOT the target-exercise volume when other exercises share
   the session.
 - Unit conventions: km→mi, m→ft, kg→lb, HH:MM:SS→seconds.
+- User caption handling: any number stated in the user's caption
+  (incline, elevation, distance, weight, etc.) is authoritative
+  user-supplied input, wins over the "not visible; ask for
+  clarification" refusal path, and loses only to a clearly-visible
+  contradicting number in the image.
+- Apple Fitness "Effort" convention: the numeric Effort score on
+  Apple Fitness Indoor Run / Indoor Walk / Indoor Cycle screens is
+  treated as the treadmill incline percentage for that session
+  (e.g. "Effort: 6 Moderate" → 6% incline), and elevation is
+  computed from incline + distance in the usual way. A caption
+  incline overrides the Effort mapping when the two disagree.
 - Common apps: shape-level recognition of Hevy, Strong, JEFIT, Apple
   Fitness/Health, Garmin Connect, Strava, WHOOP, Fitbod, NTC.
 - Anti-patterns: never invent numbers; never classify food photos /

@@ -47,15 +47,11 @@ class WorkoutStats(BaseModel):
     duration_seconds: float | None = Field(
         default=None, description="Total workout duration in seconds."
     )
-    distance_miles: float | None = Field(
-        default=None, description="Total distance in miles."
-    )
+    distance_miles: float | None = Field(default=None, description="Total distance in miles.")
     elevation_gain_feet: float | None = Field(
         default=None, description="Total elevation gained in feet."
     )
-    calories: int | None = Field(
-        default=None, description="Total calories burned."
-    )
+    calories: int | None = Field(default=None, description="Total calories burned.")
     heart_rate_avg_bpm: int | None = Field(
         default=None, description="Average heart rate in beats per minute."
     )
@@ -78,9 +74,7 @@ class WorkoutStats(BaseModel):
         default_factory=dict,
         description="Any other clearly-visible metric not covered above. Short string values only.",
     )
-    confidence: float = Field(
-        description="0.0-1.0 confidence in the overall extraction quality."
-    )
+    confidence: float = Field(description="0.0-1.0 confidence in the overall extraction quality.")
     notes: str | None = Field(
         default=None, description="Optional short note (e.g. what part of the image was unclear)."
     )
@@ -148,6 +142,8 @@ The current challenge is:
 
 You will receive one or more images posted together in a single Discord message. Your job is to figure out how many WORKOUT SESSIONS are in the batch and extract the stats for each.
 
+The user may include a caption in the same message. When present, the caption is shown to you as text before the images. Follow the "User caption" rules in the shared workout domain knowledge above: caption numbers fill fields the image doesn't show and override the "not visible" refusal path, but a clearly-visible number in the image wins over a contradicting caption.
+
 For every session you identify, produce one WorkoutStats entry with:
 - duration_seconds: total session duration in seconds (convert hours/minutes as needed)
 - distance_miles: total distance in miles (convert km if shown)
@@ -159,22 +155,24 @@ For every session you identify, produce one WorkoutStats entry with:
 - extras: any other clearly-visible metric not covered above, as short string key-value pairs
 - image_indices: the zero-based indices of the input images that contributed to this session
 
-Extract only values you can clearly see. Prefer null over a guess. Set `confidence` based on legibility.
+Extract only values you can clearly see OR that the user stated in their caption. Prefer null over a guess. Set `confidence` based on legibility.
 
 Use the multi-image rules in the shared workout domain knowledge (Pattern A / Pattern B / display cycle) to decide how to group images into sessions. Return one session per group.
 
 If a screenshot is NOT a workout tracker (meme, food photo, random selfie), set is_workout_screenshot=false for that session and leave stat fields null.
 
 Ambiguity handling:
-Only set needs_clarification=true when the batch is genuinely ambiguous even after applying the multi-image rules. Most cases resolve unambiguously. When you do flag ambiguity, still return your best-guess split in `sessions`, and write a specific question in `clarification_question` explaining what you need the user to tell you.
+Only set needs_clarification=true when the batch is genuinely ambiguous even after applying the multi-image rules AND the caption (if any) doesn't resolve the ambiguity. Most cases resolve unambiguously. When you do flag ambiguity, still return your best-guess split in `sessions`, and write a specific question in `clarification_question` explaining what you need the user to tell you.
 
-Fill `reasoning` with a short sentence about how you interpreted the batch (e.g., "One treadmill session with a cooldown segment", "Four independent interval sessions on the same machine", "Multi-exercise strength workout combined into one session").
+Fill `reasoning` with a short sentence about how you interpreted the batch (e.g., "One treadmill session with a cooldown segment", "Four independent interval sessions on the same machine", "Multi-exercise strength workout combined into one session", "Caption supplied the incline percentage").
 """
 )
 
 
 def extract(
-    images: Sequence[tuple[bytes, str]], event_prompt: str
+    images: Sequence[tuple[bytes, str]],
+    event_prompt: str,
+    caption: str | None = None,
 ) -> SessionBatch:
     """Run vision extraction against Bedrock on a batch of images.
 
@@ -184,6 +182,12 @@ def extract(
             preserved and becomes the zero-based ``image_indices``
             values in the returned sessions.
         event_prompt: The active event's editable prompt.
+        caption: Optional text the user posted alongside the images.
+            When provided, the model uses it to fill fields the images
+            don't show (e.g. a user typing "incline 6%" or "Effort is
+            6.5%" alongside an Apple Fitness Indoor Run screenshot).
+            See the "User caption" section in the shared workout
+            domain knowledge for the exact precedence rules.
 
     Returns:
         A ``SessionBatch`` describing every workout session the model
@@ -202,33 +206,35 @@ def extract(
                 f"image {i}: unsupported format {fmt!r}; expected one of {_ALLOWED_FORMATS}"
             )
 
+    caption_clean = (caption or "").strip()
     logger.info(
         f"invoking vision agent: {len(images)} image(s), "
-        f"total_bytes={sum(len(b) for b, _ in images)}"
+        f"total_bytes={sum(len(b) for b, _ in images)}, "
+        f"caption_len={len(caption_clean)}"
     )
 
-    system_prompt = _SYSTEM_PROMPT_TEMPLATE.replace(
-        "{event_prompt}", event_prompt
-    )
+    system_prompt = _SYSTEM_PROMPT_TEMPLATE.replace("{event_prompt}", event_prompt)
     agent = Agent(
         model=bedrock_model,
         system_prompt=system_prompt,
         structured_output_model=SessionBatch,
     )
-    content: list[ContentBlock] = [
-        {
-            "text": (
-                f"You are given {len(images)} image(s) posted together in one "
-                f"Discord message. Reason about them as a batch, group them into "
-                f"workout sessions per the domain rules, and return one entry per "
-                f"session."
-            )
-        },
-    ]
-    for image_bytes, image_format in images:
-        content.append(
-            {"image": {"format": image_format, "source": {"bytes": image_bytes}}}
+    intro_text = (
+        f"You are given {len(images)} image(s) posted together in one "
+        f"Discord message. Reason about them as a batch, group them into "
+        f"workout sessions per the domain rules, and return one entry per "
+        f"session."
+    )
+    if caption_clean:
+        intro_text += (
+            f"\n\nThe user's caption on this message was:\n"
+            f"{caption_clean!r}\n"
+            f"Treat any numbers or facts the caption states as user-supplied "
+            f"input per the caption rules in the domain knowledge."
         )
+    content: list[ContentBlock] = [{"text": intro_text}]
+    for image_bytes, image_format in images:
+        content.append({"image": {"format": image_format, "source": {"bytes": image_bytes}}})
 
     result = agent(content)
     if result.structured_output is None:

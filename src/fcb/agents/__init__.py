@@ -60,6 +60,22 @@ Unit conventions:
 - Duration: convert any HH:MM:SS or "1h 12m 5s" display into total
   seconds.
 
+User caption:
+- The user may include a text caption on the same message as the
+  screenshots. The caption is passed to you as text before the images
+  when present.
+- Treat any number or fact the caption states as authoritative user-
+  supplied input. Use it to fill fields the images don't show
+  clearly. Examples: "incline 6%", "6% grade", "Effort is 6.5%",
+  "elevation 400 ft", "40 min run", "70 lb dumbbells".
+- A caption number wins over the "no numeric value visible; ask for
+  clarification" refusal path. If the user supplied it, take it.
+- A caption number that directly contradicts a clearly-visible
+  different number in the image loses to the image. Note the
+  discrepancy in ``notes`` in that case.
+- Never invent a number that neither the image nor the caption
+  states.
+
 Apps you may see (recognize the shape; do not assume anything not
 visible):
 - Hevy, Strong, JEFIT — strength training logs; per-set weight/reps
@@ -67,6 +83,24 @@ visible):
 - Apple Fitness / Health, Garmin Connect, Strava, WHOOP — cardio-first
   displays with distance/pace/HR/elevation.
 - Fitbod, Nike Training Club — mixed cardio + strength.
+
+Apple Fitness "Effort" field convention (this community's rule):
+- Apple Fitness displays an "Effort" score on Indoor Run / Indoor
+  Walk / Indoor Cycle sessions where the equipment doesn't report
+  incline directly. The screen shows a numeric value (1-10) with a
+  text label like "Easy", "Moderate", "Hard" and a bar chart.
+- For this community's elevation-style challenges, treat the numeric
+  Effort value as the treadmill incline percentage for that session.
+  Example: "Effort: 6 Moderate" means 6% incline; "Effort: 8 Hard"
+  means 8% incline.
+- Compute elevation from the incline and distance in the usual way:
+  elevation_ft ≈ distance_miles × 5280 × (grade / 100).
+- Also record ``extras.effort`` with the original label ("6 Moderate")
+  so the raw display value is preserved.
+- The user's caption overrides this convention when it states a
+  different incline explicitly. "Effort is 6.5%" alongside a screen
+  showing "6 Moderate" means the user is telling you the real incline
+  was 6.5%.
 
 Anti-patterns:
 - Never invent a number the image does not show. Prefer null over a

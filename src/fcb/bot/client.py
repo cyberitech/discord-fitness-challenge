@@ -17,11 +17,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 import discord
+import imagehash
 from discord import app_commands
 from discord.ext import tasks
 from PIL import Image
-
-import imagehash
 
 from fcb import config, runtime_config
 from fcb.agents import router, vision, voice
@@ -279,9 +278,7 @@ def _parse_ts(value: str | None) -> datetime | None:
         return None
     normalized = value.replace("T", " ")[:19]
     try:
-        return datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S").replace(
-            tzinfo=timezone.utc
-        )
+        return datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
 
@@ -292,9 +289,7 @@ def _humanize_ago(iso_ts: str) -> str:
         # Stored timestamps may be either 'YYYY-MM-DD HH:MM:SS' (CURRENT_TIMESTAMP)
         # or 'YYYY-MM-DDTHH:MM:SS...' (message.created_at.isoformat()).
         normalized = iso_ts.replace("T", " ")[:19]
-        posted = datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S").replace(
-            tzinfo=timezone.utc
-        )
+        posted = datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except ValueError:
         return iso_ts
     delta = datetime.now(timezone.utc) - posted
@@ -388,9 +383,7 @@ class FCBClient(discord.Client):
             return None
         return str(interaction.guild_id)
 
-    async def _wrong_channel_reject(
-        self, interaction: discord.Interaction, guild_id: str
-    ) -> bool:
+    async def _wrong_channel_reject(self, interaction: discord.Interaction, guild_id: str) -> bool:
         """Reject if interaction isn't in the guild's bound channel.
 
         Returns True when rejection was sent (caller should return
@@ -507,23 +500,25 @@ class FCBClient(discord.Client):
                         f"{primary_formatted} ({_format_metric_label(metric)}) · "
                         f"last {last_ago}"
                     )
-                    event_progress.append({
-                        "name": event["name"],
-                        "participated": True,
-                        "submission_count": progress["submission_count"],
-                        "primary_value_formatted": primary_formatted,
-                        "primary_metric_label": _format_metric_label(metric),
-                        "last_ago": last_ago,
-                    })
-                else:
-                    footer_lines.append(
-                        f"-# **{event['name']}** — no submissions yet"
+                    event_progress.append(
+                        {
+                            "name": event["name"],
+                            "participated": True,
+                            "submission_count": progress["submission_count"],
+                            "primary_value_formatted": primary_formatted,
+                            "primary_metric_label": _format_metric_label(metric),
+                            "last_ago": last_ago,
+                        }
                     )
-                    event_progress.append({
-                        "name": event["name"],
-                        "participated": False,
-                        "primary_metric_label": _format_metric_label(metric),
-                    })
+                else:
+                    footer_lines.append(f"-# **{event['name']}** — no submissions yet")
+                    event_progress.append(
+                        {
+                            "name": event["name"],
+                            "participated": False,
+                            "primary_metric_label": _format_metric_label(metric),
+                        }
+                    )
 
             try:
                 voice_line = await asyncio.to_thread(
@@ -606,15 +601,17 @@ class FCBClient(discord.Client):
                 )
                 days_left_str = f"{days_left}d left" if days_left is not None else "no end date"
 
-                events_data.append({
-                    "name": event["name"],
-                    "kind": event["kind"],
-                    "prompt": event["prompt"][:200],
-                    "primary_metric_label": metric_label,
-                    "participant_count": participant_count,
-                    "submission_count": submission_count,
-                    "days_remaining": days_left,
-                })
+                events_data.append(
+                    {
+                        "name": event["name"],
+                        "kind": event["kind"],
+                        "prompt": event["prompt"][:200],
+                        "primary_metric_label": metric_label,
+                        "participant_count": participant_count,
+                        "submission_count": submission_count,
+                        "days_remaining": days_left,
+                    }
+                )
                 footer_lines.append(
                     f"-# **{event['name']}** — ranked by {metric_label} · "
                     f"{participant_count} participant"
@@ -669,9 +666,7 @@ class FCBClient(discord.Client):
                 guild_id,
             )
             if not active_events:
-                await interaction.response.send_message(
-                    "No active challenge right now."
-                )
+                await interaction.response.send_message("No active challenge right now.")
                 return
 
             per_event_limit = 10 if len(active_events) == 1 else 5
@@ -889,8 +884,7 @@ class FCBClient(discord.Client):
                 level="INFO",
                 category="command.describe",
                 message=(
-                    f"{interaction.user} asked for a description of "
-                    f"{message.author}'s message"
+                    f"{interaction.user} asked for a description of " f"{message.author}'s message"
                 ),
                 actor=invoker_id,
                 context={
@@ -905,8 +899,6 @@ class FCBClient(discord.Client):
                     voice.describe_publicly,
                     guild_id=guild_id,
                     user_display_name=message.author.display_name,
-                    event_name=event["name"] if event else None,
-                    event_prompt=event["prompt"] if event else None,
                     image_bytes=image_bytes,
                     image_format=image_format,
                 )
@@ -961,8 +953,7 @@ class FCBClient(discord.Client):
         )
         self.lifecycle_scheduler.start()
         logger.info(
-            f"starting nag scheduler: "
-            f"interval={config.FCB_NAG_INTERVAL_HOURS}h (per-guild)"
+            f"starting nag scheduler: " f"interval={config.FCB_NAG_INTERVAL_HOURS}h (per-guild)"
         )
         self.nag_scheduler.start()
 
@@ -1061,9 +1052,7 @@ class FCBClient(discord.Client):
             role_prefix = _announce_role_prefix(guild_id)
             await channel.send(
                 f"{role_prefix}📣 **{event['name']}** — {line}",
-                allowed_mentions=discord.AllowedMentions(
-                    everyone=False, users=False, roles=True
-                ),
+                allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True),
             )
             await asyncio.to_thread(dao.mark_event_announced_upcoming, event["id"])
             await asyncio.to_thread(
@@ -1106,9 +1095,7 @@ class FCBClient(discord.Client):
             role_prefix = _announce_role_prefix(guild_id)
             await channel.send(
                 f"{role_prefix}🎬 **{event['name']}** — {line}",
-                allowed_mentions=discord.AllowedMentions(
-                    everyone=False, users=False, roles=True
-                ),
+                allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True),
             )
             await asyncio.to_thread(dao.mark_event_announced_start, event["id"])
             await asyncio.to_thread(
@@ -1126,9 +1113,7 @@ class FCBClient(discord.Client):
                 await asyncio.to_thread(dao.mark_event_announced_end, event["id"])
                 continue
             if (now - ends_at).total_seconds() > grace_seconds:
-                logger.info(
-                    f"lifecycle: skipping stale end announcement for event #{event['id']}"
-                )
+                logger.info(f"lifecycle: skipping stale end announcement for event #{event['id']}")
                 await asyncio.to_thread(dao.mark_event_announced_end, event["id"])
                 await asyncio.to_thread(
                     dao.record_event,
@@ -1177,9 +1162,7 @@ class FCBClient(discord.Client):
             role_prefix = _announce_role_prefix(guild_id)
             await channel.send(
                 f"{role_prefix}🏁 **{event['name']}** — {line}",
-                allowed_mentions=discord.AllowedMentions(
-                    everyone=False, users=False, roles=True
-                ),
+                allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True),
             )
             await asyncio.to_thread(dao.mark_event_announced_end, event["id"])
             await asyncio.to_thread(
@@ -1338,9 +1321,7 @@ class FCBClient(discord.Client):
             )
         except Exception as e:
             logger.error(traceback.format_exc())
-            logger.error(
-                f"reminder voice failed for #{event['id']}/{latest_kind}: {e}"
-            )
+            logger.error(f"reminder voice failed for #{event['id']}/{latest_kind}: {e}")
             return 0, skipped_count
 
         emoji_map = {
@@ -1353,9 +1334,7 @@ class FCBClient(discord.Client):
         role_prefix = _announce_role_prefix(guild_id)
         await channel.send(
             f"{role_prefix}{emoji} **{event['name']}** — {line}",
-            allowed_mentions=discord.AllowedMentions(
-                everyone=False, users=False, roles=True
-            ),
+            allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True),
         )
         await asyncio.to_thread(
             dao.mark_reminder_sent,
@@ -1368,8 +1347,7 @@ class FCBClient(discord.Client):
             level="INFO",
             category=f"lifecycle.reminder_{latest_kind}",
             message=(
-                f"posted {latest_kind} reminder for event #{event['id']}: "
-                f"{event['name']}"
+                f"posted {latest_kind} reminder for event #{event['id']}: " f"{event['name']}"
             ),
             actor="bot",
             context={
@@ -1430,9 +1408,7 @@ class FCBClient(discord.Client):
             return
         channel = self.get_channel(int(channel_id_str))
         if channel is None:
-            logger.error(
-                f"nag scan: cannot resolve channel {channel_id_str} for guild {guild_id}"
-            )
+            logger.error(f"nag scan: cannot resolve channel {channel_id_str} for guild {guild_id}")
             return
 
         now = datetime.now(timezone.utc)
@@ -1462,8 +1438,10 @@ class FCBClient(discord.Client):
 
             user_row = await asyncio.to_thread(dao.get_user, uid)
             display_name = (
-                user_row.get("display_name") if user_row else None
-            ) or (user_row.get("username") if user_row else None) or "there"
+                (user_row.get("display_name") if user_row else None)
+                or (user_row.get("username") if user_row else None)
+                or "there"
+            )
 
             try:
                 nag_line = await asyncio.to_thread(
@@ -1496,8 +1474,7 @@ class FCBClient(discord.Client):
                 level="INFO",
                 category="nag.sent",
                 message=(
-                    f"nagged {display_name} ({uid}) — "
-                    f"{int(round(days_since))}d since last post"
+                    f"nagged {display_name} ({uid}) — " f"{int(round(days_since))}d since last post"
                 ),
                 actor="bot",
                 context={
@@ -1548,9 +1525,7 @@ class FCBClient(discord.Client):
                 f"&permissions={config.FCB_BOT_PERMISSIONS}"
                 f"&scope=bot%20applications.commands"
             )
-            logger.warning(
-                f"bot is not a member of any guild; invite it with: {invite_url}"
-            )
+            logger.warning(f"bot is not a member of any guild; invite it with: {invite_url}")
             await asyncio.to_thread(
                 dao.record_event,
                 level="WARNING",
@@ -1689,9 +1664,7 @@ class FCBClient(discord.Client):
         if self._is_known_guild(role.guild):
             await self._refresh_guild_cache(role.guild)
 
-    async def on_guild_role_update(
-        self, before: discord.Role, after: discord.Role
-    ) -> None:
+    async def on_guild_role_update(self, before: discord.Role, after: discord.Role) -> None:
         if self._is_known_guild(after.guild) and before.name != after.name:
             await self._refresh_guild_cache(after.guild)
 
@@ -1803,9 +1776,7 @@ class FCBClient(discord.Client):
         # the LLM only sees the actual question.
         question = re.sub(rf"<@!?{self.user.id}>", "", message.content)
         for name in self._bot_names_lower(message):
-            question = re.sub(
-                rf"@{re.escape(name)}", "", question, flags=re.IGNORECASE
-            )
+            question = re.sub(rf"@{re.escape(name)}", "", question, flags=re.IGNORECASE)
         question = question.strip()
         if not question:
             question = "(no question, just a hello)"
@@ -1841,7 +1812,9 @@ class FCBClient(discord.Client):
                 try:
                     link_channel = self.get_channel(link_channel_id)
                     if link_channel:
-                        link_msg = await link_channel.fetch_message(link_message_id)  # type: ignore[union-attr]
+                        link_msg = await link_channel.fetch_message(  # type: ignore[union-attr]
+                            link_message_id
+                        )
                         for att in link_msg.attachments:
                             fmt = _image_format(att)
                             if fmt:
@@ -1884,7 +1857,8 @@ class FCBClient(discord.Client):
             # happening. Excludes the mention message itself. Oldest → newest.
             history_limit = runtime_config.chat_history_messages(guild_id)
             history_fetch: list[discord.Message] = [
-                m async for m in message.channel.history(limit=history_limit + 1)
+                m
+                async for m in message.channel.history(limit=history_limit + 1)
                 if m.id != message.id
             ][:history_limit]
             history_fetch.reverse()
@@ -1899,11 +1873,13 @@ class FCBClient(discord.Client):
                     )
                 if not content:
                     continue
-                channel_history.append({
-                    "time_ago": _humanize_ago(m.created_at.isoformat()),
-                    "author": m.author.display_name,
-                    "content": content[:400],
-                })
+                channel_history.append(
+                    {
+                        "time_ago": _humanize_ago(m.created_at.isoformat()),
+                        "author": m.author.display_name,
+                        "content": content[:400],
+                    }
+                )
 
             # Progress snapshots for the invoker plus every OTHER user
             # @-mentioned in the question. This is what makes queries like
@@ -1937,27 +1913,29 @@ class FCBClient(discord.Client):
                     else:
                         primary_formatted = "none"
                         last_ago = "never"
-                    per_event.append({
-                        "event_name": event["name"],
-                        "primary_metric_label": _format_metric_label(metric),
-                        "primary_value": primary_formatted,
-                        "submission_count": progress["submission_count"],
-                        "last_ago": last_ago,
-                    })
-                user_snapshots.append({
-                    "display_name": u.display_name,
-                    "username": u.name,
-                    "is_invoker": u.id == message.author.id,
-                    "per_event": per_event,
-                })
+                    per_event.append(
+                        {
+                            "event_name": event["name"],
+                            "primary_metric_label": _format_metric_label(metric),
+                            "primary_value": primary_formatted,
+                            "submission_count": progress["submission_count"],
+                            "last_ago": last_ago,
+                        }
+                    )
+                user_snapshots.append(
+                    {
+                        "display_name": u.display_name,
+                        "username": u.name,
+                        "is_invoker": u.id == message.author.id,
+                        "per_event": per_event,
+                    }
+                )
 
             # Top-10 leaderboard per active event so "who's winning" and
             # "what's the leaderboard" queries have real data to reference.
             leaderboards: list[dict[str, object]] = []
             for event in active_events:
-                board = await asyncio.to_thread(
-                    dao.get_event_leaderboard, event["id"], 10
-                )
+                board = await asyncio.to_thread(dao.get_event_leaderboard, event["id"], 10)
                 metric = event["primary_metric"]
                 entries = [
                     {
@@ -1972,11 +1950,13 @@ class FCBClient(discord.Client):
                     }
                     for i, entry in enumerate(board)
                 ]
-                leaderboards.append({
-                    "event_name": event["name"],
-                    "primary_metric_label": _format_metric_label(metric),
-                    "entries": entries,
-                })
+                leaderboards.append(
+                    {
+                        "event_name": event["name"],
+                        "primary_metric_label": _format_metric_label(metric),
+                        "entries": entries,
+                    }
+                )
 
             events_summary = [
                 {
@@ -2002,22 +1982,22 @@ class FCBClient(discord.Client):
                 stats_json = r.get("extracted_stats")
                 try:
                     stats_dict = (
-                        json.loads(stats_json)
-                        if isinstance(stats_json, str) and stats_json
-                        else {}
+                        json.loads(stats_json) if isinstance(stats_json, str) and stats_json else {}
                     )
                 except json.JSONDecodeError:
                     stats_dict = {}
-                invoker_recent_submissions.append({
-                    "submission_id": r["id"],
-                    "status": r["status"],
-                    "event_name": r.get("event_name"),
-                    "is_workout_screenshot": stats_dict.get("is_workout_screenshot"),
-                    "workout_type": stats_dict.get("workout_type"),
-                    "confidence": stats_dict.get("confidence"),
-                    "vision_notes": stats_dict.get("notes"),
-                    "posted_ago": _humanize_ago(r["created_at"]),
-                })
+                invoker_recent_submissions.append(
+                    {
+                        "submission_id": r["id"],
+                        "status": r["status"],
+                        "event_name": r.get("event_name"),
+                        "is_workout_screenshot": stats_dict.get("is_workout_screenshot"),
+                        "workout_type": stats_dict.get("workout_type"),
+                        "confidence": stats_dict.get("confidence"),
+                        "vision_notes": stats_dict.get("notes"),
+                        "posted_ago": _humanize_ago(r["created_at"]),
+                    }
+                )
 
             try:
                 reply_text = await asyncio.to_thread(
@@ -2081,16 +2061,19 @@ class FCBClient(discord.Client):
         message: discord.Message,
         image_bytes: bytes,
         image_format: str,
-        active_event: dict | None,
         submission_id: int,
         reason: str,
     ) -> None:
-        """Post the hardcore-riff reply for a non-recognized image.
+        """Post the reactive riff reply for a non-recognized image.
 
         Called only when ``bot.reply_only_on_challenge_match`` is false.
         Sends the raw image to Bedrock through voice.hardcore_riff so the
         model can reference specifics visible in the image, then replies
         in-channel and records a ``submission.riff.<reason>`` event.
+
+        Intentionally passes no active-event context to voice — the riff
+        reacts to the image on its own terms, without redirecting to
+        whatever challenge happens to be running.
         """
         try:
             line = await asyncio.to_thread(
@@ -2099,8 +2082,6 @@ class FCBClient(discord.Client):
                 user_display_name=message.author.display_name,
                 image_bytes=image_bytes,
                 image_format=image_format,
-                active_event_name=active_event["name"] if active_event else None,
-                active_event_prompt=active_event["prompt"] if active_event else None,
             )
         except Exception as e:
             logger.error(traceback.format_exc())
@@ -2124,10 +2105,7 @@ class FCBClient(discord.Client):
             dao.record_event,
             level="INFO",
             category=f"submission.riff.{reason}",
-            message=(
-                f"posted hardcore riff for submission #{submission_id} "
-                f"({reason})"
-            ),
+            message=(f"posted hardcore riff for submission #{submission_id} " f"({reason})"),
             actor=str(message.author.id),
             context={
                 "message_id": str(message.id),
@@ -2194,9 +2172,7 @@ class FCBClient(discord.Client):
             return
 
         # Step 2 — duplicate check
-        dup_map = await asyncio.to_thread(
-            dao.find_duplicate_hashes, [s["hash"] for s in saved]
-        )
+        dup_map = await asyncio.to_thread(dao.find_duplicate_hashes, [s["hash"] for s in saved])
         if dup_map:
             # Build a human-readable list of dup references. The link
             # points at the original Discord message so anyone in the
@@ -2223,15 +2199,9 @@ class FCBClient(discord.Client):
                         f"{orig['guild_id']}/{orig['channel_id']}/{orig_msg_id}"
                     )
                 else:
-                    link = (
-                        f"{config.FCB_PUBLIC_BASE_URL}/submissions/{original_id}"
-                    )
-                dup_lines.append(
-                    f"image {i + 1} matches submission [#{original_id}]({link})"
-                )
-            logger.info(
-                f"duplicate detected for message {message.id}: {dup_lines}"
-            )
+                    link = f"{config.FCB_PUBLIC_BASE_URL}/submissions/{original_id}"
+                dup_lines.append(f"image {i + 1} matches submission [#{original_id}]({link})")
+            logger.info(f"duplicate detected for message {message.id}: {dup_lines}")
             await asyncio.to_thread(
                 dao.record_event,
                 level="INFO",
@@ -2256,9 +2226,7 @@ class FCBClient(discord.Client):
             return
 
         # Step 3 — no active events -> insert rejected placeholders, stay silent or riff
-        active_events = await asyncio.to_thread(
-            dao.list_active_events, guild_id
-        )
+        active_events = await asyncio.to_thread(dao.list_active_events, guild_id)
         if not active_events:
             for i, s in enumerate(saved):
                 suffix = f"_{i}" if len(saved) > 1 else ""
@@ -2281,9 +2249,7 @@ class FCBClient(discord.Client):
                     images=[(s["path"], s["hash"])],
                 )
             if runtime_config.reply_only_on_challenge_match(guild_id):
-                logger.info(
-                    f"silent: no active event for message {message.id}"
-                )
+                logger.info(f"silent: no active event for message {message.id}")
                 await asyncio.to_thread(
                     dao.record_event,
                     level="INFO",
@@ -2305,7 +2271,6 @@ class FCBClient(discord.Client):
                     message=message,
                     image_bytes=riff_bytes,
                     image_format=riff_fmt,
-                    active_event=None,
                     submission_id=0,
                     reason="no_event",
                 )
@@ -2318,15 +2283,17 @@ class FCBClient(discord.Client):
             downsized: list[tuple[bytes, str]] = [
                 _downsize_image(s["bytes"], s["format"]) for s in saved
             ]
+            caption = (message.content or "").strip() or None
             try:
                 batch = await asyncio.to_thread(
-                    vision.extract, downsized, primary_hint["prompt"]
+                    vision.extract,
+                    downsized,
+                    primary_hint["prompt"],
+                    caption,
                 )
             except Exception as e:
                 logger.error(traceback.format_exc())
-                logger.error(
-                    f"vision extraction failed for message {message.id}: {e}"
-                )
+                logger.error(f"vision extraction failed for message {message.id}: {e}")
                 # One placeholder submission per image, all rejected
                 for i, s in enumerate(saved):
                     suffix = f"_{i}" if len(saved) > 1 else ""
@@ -2372,9 +2339,7 @@ class FCBClient(discord.Client):
             # Defensive: filter out-of-range
             indices = [i for i in indices if 0 <= i < num_images]
             if not indices:
-                logger.warning(
-                    f"session {sidx} has no valid image_indices; skipping"
-                )
+                logger.warning(f"session {sidx} has no valid image_indices; skipping")
                 continue
             session_images = [saved[i] for i in indices]
 
@@ -2408,8 +2373,7 @@ class FCBClient(discord.Client):
                 except Exception as e:
                     logger.error(traceback.format_exc())
                     logger.error(
-                        f"router failed for session {sidx} of message "
-                        f"{message.id}: {e}"
+                        f"router failed for session {sidx} of message " f"{message.id}: {e}"
                     )
                     matched_event_ids = []
                     await asyncio.to_thread(
@@ -2496,9 +2460,7 @@ class FCBClient(discord.Client):
                 dao.record_event,
                 level="INFO",
                 category="submission.needs_clarification",
-                message=(
-                    f"batch needs clarification: {batch.clarification_question}"
-                ),
+                message=(f"batch needs clarification: {batch.clarification_question}"),
                 actor=author_id,
                 guild_id=guild_id,
                 context={
@@ -2518,10 +2480,7 @@ class FCBClient(discord.Client):
                     dao.record_event,
                     level="INFO",
                     category="submission.silent.no_match",
-                    message=(
-                        f"no session in batch matched; "
-                        f"reasoning={batch.reasoning!r}"
-                    ),
+                    message=(f"no session in batch matched; " f"reasoning={batch.reasoning!r}"),
                     actor=author_id,
                     guild_id=guild_id,
                     context={
@@ -2538,10 +2497,7 @@ class FCBClient(discord.Client):
                     message=message,
                     image_bytes=riff_bytes,
                     image_format=riff_fmt,
-                    active_event=primary_hint,
-                    submission_id=session_records[0]["submission_id"]
-                    if session_records
-                    else 0,
+                    submission_id=session_records[0]["submission_id"] if session_records else 0,
                     reason="no_match",
                 )
             return
@@ -2552,9 +2508,7 @@ class FCBClient(discord.Client):
         if len(approved) == 1:
             r = approved[0]
             stats_for_voice = r["session"]
-            primary_event = matched_by_id.get(
-                r["matched_event_ids"][0], active_events[0]
-            )
+            primary_event = matched_by_id.get(r["matched_event_ids"][0], active_events[0])
         else:
             total_stats: dict[str, float] = {}
             for r in approved:
@@ -2571,9 +2525,7 @@ class FCBClient(discord.Client):
                         total_stats[key] = total_stats.get(key, 0.0) + float(val)
             base = approved[0]["session"].model_dump()
             stats_for_voice = WorkoutStats(**{**base, **total_stats})
-            primary_event = matched_by_id.get(
-                approved[0]["matched_event_ids"][0], active_events[0]
-            )
+            primary_event = matched_by_id.get(approved[0]["matched_event_ids"][0], active_events[0])
 
         async with message.channel.typing():
             voice_line = await asyncio.to_thread(
@@ -2672,8 +2624,7 @@ class FCBClient(discord.Client):
         active_events = await asyncio.to_thread(dao.list_active_events, guild_id)
         if not active_events:
             await message.reply(
-                "There\u2019s no active challenge right now. Your submissions "
-                "stay pending."
+                "There\u2019s no active challenge right now. Your submissions " "stay pending."
             )
             return
 
@@ -2681,7 +2632,7 @@ class FCBClient(discord.Client):
         augmented_prompt = (
             f"{primary_hint['prompt']}\n\n"
             f"USER CLARIFICATION: The user was asked about ambiguity in these "
-            f"screenshots and replied: \"{clarification_text}\"\n"
+            f'screenshots and replied: "{clarification_text}"\n'
             f"Use this information to resolve the ambiguity and split the images "
             f"into sessions accordingly. Do NOT set needs_clarification=true — "
             f"the user has already answered."
@@ -2689,14 +2640,10 @@ class FCBClient(discord.Client):
 
         async with message.channel.typing():
             try:
-                batch = await asyncio.to_thread(
-                    vision.extract, images, augmented_prompt
-                )
+                batch = await asyncio.to_thread(vision.extract, images, augmented_prompt)
             except Exception as e:
                 logger.error(traceback.format_exc())
-                logger.error(
-                    f"re-extraction failed for clarification reply {message.id}: {e}"
-                )
+                logger.error(f"re-extraction failed for clarification reply {message.id}: {e}")
                 await message.reply(
                     "Something went wrong re-processing the screenshots. "
                     "An admin can review from the dashboard."
@@ -2706,7 +2653,6 @@ class FCBClient(discord.Client):
             # Finalize: we now have N pending submissions and vision returned
             # M sessions. We update up to min(N, M) submissions in place and
             # reject any extras.
-            num_images = len(image_records)
             finalized: list[dict] = []
             for sidx, session in enumerate(batch.sessions):
                 if sidx >= len(pending_subs):
@@ -2732,17 +2678,11 @@ class FCBClient(discord.Client):
                         )
                         matched_event_ids = decision.matched_event_ids
                     except Exception as e:
-                        logger.error(
-                            f"router failed on clarification re-run for #{sid}: {e}"
-                        )
+                        logger.error(f"router failed on clarification re-run for #{sid}: {e}")
 
-                recognized = session.is_workout_screenshot and bool(
-                    matched_event_ids
-                )
+                recognized = session.is_workout_screenshot and bool(matched_event_ids)
                 new_status = "approved" if recognized else "rejected"
-                primary_event_id = (
-                    matched_event_ids[0] if matched_event_ids else None
-                )
+                primary_event_id = matched_event_ids[0] if matched_event_ids else None
 
                 await asyncio.to_thread(
                     dao.update_submission_after_clarification,
@@ -2771,7 +2711,7 @@ class FCBClient(discord.Client):
 
             # If vision produced fewer sessions than pending rows, reject
             # the extras.
-            for extra in pending_subs[len(batch.sessions):]:
+            for extra in pending_subs[len(batch.sessions) :]:
                 await asyncio.to_thread(
                     dao.update_submission_after_clarification,
                     submission_id=extra["id"],
@@ -2790,8 +2730,7 @@ class FCBClient(discord.Client):
                 level="INFO",
                 category="submission.clarification_resolved",
                 message=(
-                    f"batch resolved after clarification into "
-                    f"{len(batch.sessions)} session(s)"
+                    f"batch resolved after clarification into " f"{len(batch.sessions)} session(s)"
                 ),
                 actor=author_id,
                 guild_id=guild_id,
@@ -2855,8 +2794,6 @@ class FCBClient(discord.Client):
                     f"submissions #{', #'.join(str(s) for s in sub_ids)}"
                 )
             await message.reply(f"<@{author_id}> {voice_line}\n-# {footer}")
-
-
 
 
 def run() -> None:

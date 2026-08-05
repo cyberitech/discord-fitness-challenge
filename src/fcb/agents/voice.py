@@ -113,22 +113,25 @@ those to your reply.
 DEFAULT_HARDCORE_RIFF_INSTRUCTION = """\
 Situation: a user posted an image in the channel that isn't a workout \
 tied to any active challenge (maybe it's food, a bloodwork chart, a \
-random selfie, a meme, whatever). Fire back a short, driving, \
-positive-but-pushy reply that ties whatever's in the image back to \
-their fitness/health arc. Reference at least one specific thing you \
-can actually see in the image (a number, an item, a detail) so the \
-line lands.
+random selfie, a meme, whatever). React to what they actually shared, \
+on its own terms. Reference at least one specific thing you can see \
+in the image (a number, an item, a detail) so the reply lands.
 
 Voice rules:
-- Motivating, hardcore-friend energy. No lecture, no scolding.
-- OTC supplements (protein, creatine, fish oil, magnesium, red yeast \
-rice, ashwagandha, etc.), gym advice, dietary suggestions, sleep, \
-hydration are all fair game. That's normal gym-friend talk.
-- Do NOT diagnose medical conditions. Do NOT recommend prescription \
-medications. Do NOT give dosage numbers for specific health \
-conditions.
-- Do NOT add disclaimers like "I can't give medical advice." Skip \
-that entirely — just be a friend giving normal advice.
+- Match the topic of the image. Food photo → talk about the food. \
+Meme → riff on the meme. Selfie → react to what they're sharing. \
+Bloodwork chart or progress photo → engage with what it shows.
+- Fitness, gym, diet, sleep, hydration commentary is welcome ONLY \
+when it's genuinely relevant to what's in the image. Forcing every \
+reply back to fitness feels like a marketing bot; skip the pivot \
+when the topic isn't fitness.
+- Do NOT redirect the conversation to any active challenge. Do NOT \
+tell them to hit the treadmill, log something, or get after the \
+challenge. They are just sharing an image, not filing a submission.
+- OTC supplements, gym advice, dietary suggestions are fair game \
+when relevant. No prescription meds. No medical diagnoses. No \
+"I can't give medical advice" disclaimers — skip that entirely.
+- No lecture, no scolding, no fake hype.
 - Keep it to one or two short sentences. Under 240 characters total.
 - Never invent numbers you can't see in the image.
 """
@@ -153,9 +156,10 @@ or two sentences.
 
 DEFAULT_CHAT_INSTRUCTION = """\
 Situation: a user @-mentioned you in the fitness-challenge channel and \
-asked a question. This is NOT a general chat bot — it exists to help \
-people check progress, see leaderboards, and get quick info about the \
-active challenges without slash commands.
+asked a question. Your primary job is helping people check progress, \
+see leaderboards, and get quick info about the active challenges — \
+but you can also carry a normal short conversation on adjacent topics \
+without being pushy.
 
 You have five buckets of context to draw from:
 - `active_events`: every currently-running challenge.
@@ -174,15 +178,20 @@ didn't match any active challenge / etc.).
 in-jokes) — do not quote it verbatim.
 
 Rules:
-- Answer using ONLY the five buckets above. Never invent numbers, event \
-names, ranks, or past events.
+- Answer using ONLY the five buckets above for anything factual about \
+challenges, progress, ranks, or past submissions. Never invent \
+numbers, event names, ranks, or past events.
 - "How is @Someone doing?" — pull that user from `user_snapshots` and \
 answer with their real numbers. If they're not in the snapshots, they \
 haven't posted anything for the active challenges; say so briefly.
 - "What's the leaderboard / who's winning?" — read directly from \
 `leaderboards`. If it's empty, say no approved submissions yet.
 - Off-topic questions (small talk, general life, memes, non-fitness): \
-short closed-ended redirect in-voice, then pivot back to the challenges.
+answer conversationally in your voice. Only mention the active \
+challenges when the user's question is actually about them. Do NOT \
+force every reply to redirect back to a challenge — small talk stays \
+small talk. Being pushy about the challenges is worse than being \
+briefly off-topic.
 - Keep replies to 1-3 short sentences.
 - Do not paste back the user's question. Do not use @-mentions in the \
 reply text.
@@ -285,13 +294,15 @@ PRESETS: dict[str, dict[str, str]] = {
         ),
         "voice.hardcore_riff_instruction": (
             "Situation: someone posted a non-workout image and the bot "
-            "is set to reply anyway. Respond with gentle, sincere "
-            "encouragement that ties whatever's in the image back to "
-            "their health arc. Reference something specific you can "
-            "actually see. OTC supplements, gym / sleep / diet / "
-            "hydration nudges are welcome. Never diagnose, never "
-            "recommend prescription meds, never add 'I can't give "
-            "medical advice' disclaimers. One or two warm sentences."
+            "is set to reply anyway. React warmly to what they actually "
+            "shared, on its own terms. Reference something specific you "
+            "can see in the image. Match the topic — food talk if it's "
+            "food, warm words about a selfie, gentle observations on a "
+            "meme. Do NOT redirect to an active challenge or tell them "
+            "to log a workout. Fitness / sleep / diet / hydration "
+            "comments only when the image is actually about that. No "
+            "diagnoses, no prescription meds, no 'I can't give medical "
+            "advice' disclaimers. One or two warm sentences."
         ),
         "voice.status_instruction": (
             "Situation: a user asked for their status. Cheer them on with "
@@ -308,9 +319,12 @@ PRESETS: dict[str, dict[str, str]] = {
         ),
         "voice.chat_instruction": (
             "Situation: someone @-mentioned you with a question. Answer "
-            "warmly using only the provided progress and challenge data. "
-            "For off-topic questions, gently redirect them back to the "
-            "challenges. Never invent numbers. Keep it to a few sentences."
+            "warmly using only the provided progress and challenge data "
+            "for anything factual about the challenges. For off-topic "
+            "questions, respond conversationally in your warm voice — "
+            "small talk stays small talk. Only mention the challenges "
+            "when the question is actually about them. Never invent "
+            "numbers. Keep it to a few sentences."
         ),
     },
     "drill_sergeant": {
@@ -370,12 +384,14 @@ PRESETS: dict[str, dict[str, str]] = {
         ),
         "voice.hardcore_riff_instruction": (
             "Situation: a soldier posted a non-workout image and the "
-            "bot is set to reply anyway. Bark a driving, tough-but-fair "
-            "line that ties whatever's in the image back to training or "
-            "recovery. Reference at least one specific thing you can "
-            "see. OTC supplements, gym / sleep / diet / hydration "
-            "orders are fair game. Do not diagnose, do not push "
-            "prescription meds, do not add refusal disclaimers. Two "
+            "bot is set to reply anyway. Bark a short line that engages "
+            "with what's actually in the image. Reference at least one "
+            "specific thing you can see. Match the topic — no forcing "
+            "training talk onto a food photo or a meme. Do NOT redirect "
+            "to any active challenge or order them to log a workout. "
+            "Training / sleep / diet / hydration orders only when the "
+            "image is genuinely about that. No diagnoses, no "
+            "prescription meds, no refusal disclaimers. One or two "
             "clipped sentences, punchy."
         ),
         "voice.status_instruction": (
@@ -391,9 +407,12 @@ PRESETS: dict[str, dict[str, str]] = {
         ),
         "voice.chat_instruction": (
             "Situation: someone hollered at you. Answer with a quick verdict "
-            "using the provided data — where they stand or what's live. "
-            "If they ask off-topic questions, snap them back to the "
-            "challenge. Never invent numbers. Short and direct."
+            "using the provided data — where they stand or what's live — "
+            "when the question is about the challenges. For off-topic "
+            "questions, answer in your clipped voice on-topic. Do NOT "
+            "snap every reply back to the challenge; that reads like a "
+            "recruiter, not a sergeant. Never invent numbers. Short and "
+            "direct."
         ),
     },
     "data_nerd": {
@@ -452,11 +471,14 @@ PRESETS: dict[str, dict[str, str]] = {
         "voice.hardcore_riff_instruction": (
             "Situation: a non-workout image was posted and the bot is "
             "set to reply anyway. Deliver one dry, precise observation "
-            "tying a specific numeric or visual detail in the image "
-            "back to a fitness / recovery lever. OTC supplements, gym "
-            "adjustments, sleep, diet, hydration are all valid levers. "
-            "No diagnoses, no prescription meds, no 'I can't give "
-            "medical advice' disclaimers. One sentence."
+            "about a specific numeric or visual detail in the image. "
+            "Match the topic — a food photo gets a dry food read, a "
+            "meme gets a dry meme read. Do NOT pivot to any active "
+            "challenge and do NOT tell them to log something. Fitness "
+            "/ sleep / diet / hydration observations only when the "
+            "image is actually about that. No diagnoses, no "
+            "prescription meds, no 'I can't give medical advice' "
+            "disclaimers. One sentence."
         ),
         "voice.status_instruction": (
             "Situation: a user requested a status readout. State what "
@@ -471,9 +493,11 @@ PRESETS: dict[str, dict[str, str]] = {
         ),
         "voice.chat_instruction": (
             "Situation: a user @-mentioned you. Answer with the relevant "
-            "figures from the provided data in one dry sentence. For "
-            "off-topic questions, redirect once and stop. No invented "
-            "numbers, no filler."
+            "figures from the provided data in one dry sentence when the "
+            "question is about the challenges. For off-topic questions, "
+            "answer with one dry on-topic sentence — do not pivot back "
+            "to the challenges every time. No invented numbers, no "
+            "filler."
         ),
     },
 }
@@ -532,21 +556,23 @@ def describe_publicly(
     *,
     guild_id: str,
     user_display_name: str,
-    event_name: str | None,
-    event_prompt: str | None,
     image_bytes: bytes,
     image_format: str,
 ) -> str:
-    """Public /describe reply — narrates what's in the image, in coach voice."""
+    """Public /describe reply — narrates what's in the image, in coach voice.
+
+    Deliberately does NOT inject the active-challenge name/prompt into
+    the system context. Describe is a react-to-what-you-see mode; the
+    image speaks for itself. If the image happens to show a workout,
+    the persona will still recognize it. If it's unrelated to any
+    challenge, the reply stays on the image's own topic instead of
+    being pulled toward whatever's running.
+    """
     if image_format not in ("png", "jpeg", "gif", "webp"):
         raise ValueError(f"unsupported image format {image_format!r}")
 
     s = get_voice_settings(guild_id)
     system = s["voice.base_persona"] + "\n\n" + s["voice.describe_instruction"]
-    if event_name:
-        system += f"\n\nCurrent challenge: {event_name}"
-        if event_prompt:
-            system += f"\nChallenge prompt: {event_prompt}"
 
     logger.info(
         f"voice.describe_publicly for {user_display_name} format={image_format} "
@@ -566,44 +592,38 @@ def hardcore_riff(
     user_display_name: str,
     image_bytes: bytes,
     image_format: str,
-    active_event_name: str | None = None,
-    active_event_prompt: str | None = None,
 ) -> str:
-    """Driving, hardcore reply for a non-workout image when the bot is set
-    to reply to every image (``bot.reply_only_on_challenge_match=false``).
+    """Reactive reply for a non-workout image when the bot is set to
+    reply to every image (``bot.reply_only_on_challenge_match=false``).
 
     Sends the raw image to Bedrock so the model can reference specifics
-    (numbers on a lab chart, food on a plate, etc.). Active event
-    context is optional and only used to keep the flavor consistent
-    when a challenge is running.
+    (numbers on a lab chart, food on a plate, etc.). Deliberately does
+    NOT inject the active-challenge name/prompt into the system
+    context — the persona reacts to what's in the image on its own
+    terms, without redirecting to any active challenge. See the
+    ``voice.hardcore_riff_instruction`` prompt for the topic-matching
+    behavior this enforces.
     """
     if image_format not in ("png", "jpeg", "gif", "webp"):
         raise ValueError(f"unsupported image format {image_format!r}")
 
     s = get_voice_settings(guild_id)
     system = s["voice.base_persona"] + "\n\n" + s["voice.hardcore_riff_instruction"]
-    if active_event_name:
-        system += f"\n\nCurrent challenge running in the background: {active_event_name}"
-        if active_event_prompt:
-            system += f"\nChallenge prompt: {active_event_prompt}"
 
     logger.info(
         f"voice.hardcore_riff for {user_display_name} format={image_format} "
-        f"bytes={len(image_bytes)} event={active_event_name!r}"
+        f"bytes={len(image_bytes)}"
     )
     agent = Agent(model=bedrock_model, system_prompt=system)
     content: list[ContentBlock] = [
         {
             "text": (
-                f"User: {user_display_name}. Riff on what's in this image "
-                f"in a driving, motivating way that ties back to fitness/health."
+                f"User: {user_display_name}. React to what's in this image " f"on its own terms."
             )
         },
         {"image": {"format": image_format, "source": {"bytes": image_bytes}}},
     ]
-    return _first_text(agent(content)) or (
-        f"{user_display_name}, whatever's going on here — get after it."
-    )
+    return _first_text(agent(content)) or (f"{user_display_name}, nice share.")
 
 
 def nag_slacker(
@@ -624,10 +644,7 @@ def nag_slacker(
         f"Days since their last post: {days_since_last_post}\n\n"
         "Write the nudge."
     )
-    logger.info(
-        f"voice.nag_slacker for {user_display_name} "
-        f"days_since={days_since_last_post}"
-    )
+    logger.info(f"voice.nag_slacker for {user_display_name} " f"days_since={days_since_last_post}")
     agent = Agent(model=bedrock_model, system_prompt=system)
     return _first_text(agent(prompt)) or f"Yo {user_display_name}, where you at?"
 
@@ -664,9 +681,7 @@ def announce_event_upcoming(
         f"hours_until_start={hours_until_start:.1f}"
     )
     agent = Agent(model=bedrock_model, system_prompt=system)
-    return _first_text(agent(prompt)) or (
-        f"**{event_name}** kicks off {when_label}. Get ready."
-    )
+    return _first_text(agent(prompt)) or (f"**{event_name}** kicks off {when_label}. Get ready.")
 
 
 def announce_event_start(
@@ -711,11 +726,7 @@ def announce_event_end(
             "Write the closing message."
         )
     else:
-        runners_line = (
-            "; ".join(f"{n} ({v})" for n, v in runner_ups)
-            if runner_ups
-            else "none"
-        )
+        runners_line = "; ".join(f"{n} ({v})" for n, v in runner_ups) if runner_ups else "none"
         prompt = (
             f"Challenge name: {event_name}\n"
             f"Challenge prompt: {event_prompt}\n"
@@ -798,9 +809,7 @@ def status_report(
         f"{[dict(p) for p in event_progress]}\n\n"
         "Write the reply."
     )
-    logger.info(
-        f"voice.status_report for {user_display_name} events={len(event_progress)}"
-    )
+    logger.info(f"voice.status_report for {user_display_name} events={len(event_progress)}")
     agent = Agent(model=bedrock_model, system_prompt=system)
     return _first_text(agent(prompt)) or f"Here's where you stand, {user_display_name}."
 
@@ -809,16 +818,11 @@ def list_challenges(*, guild_id: str, events: list[Mapping[str, Any]]) -> str:
     """Persona-flavored intro for the /list command."""
     s = get_voice_settings(guild_id)
     system = s["voice.base_persona"] + "\n\n" + s["voice.list_instruction"]
-    prompt = (
-        f"Active challenges right now:\n"
-        f"{[dict(e) for e in events]}\n\n"
-        "Write the intro."
-    )
+    prompt = f"Active challenges right now:\n" f"{[dict(e) for e in events]}\n\n" "Write the intro."
     logger.info(f"voice.list_challenges events={len(events)}")
     agent = Agent(model=bedrock_model, system_prompt=system)
     fallback = f"{len(events)} challenge{'s' if len(events) != 1 else ''} running right now."
     return _first_text(agent(prompt)) or fallback
-
 
 
 def chat_reply(
