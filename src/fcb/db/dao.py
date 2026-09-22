@@ -62,10 +62,7 @@ def apply_migrations() -> int:
             sql = migration.read_text()
             # Bundle the record-insert into the same script so the whole
             # migration commits atomically.
-            script = (
-                sql
-                + f"\nINSERT INTO schema_migrations (version) VALUES ('{version}');\n"
-            )
+            script = sql + f"\nINSERT INTO schema_migrations (version) VALUES ('{version}');\n"
             conn.executescript(script)
             count += 1
             logger.info(f"migration {version} complete")
@@ -117,9 +114,7 @@ def record_event(
 # ---------------------------------------------------------------------------
 
 
-def upsert_bot_guild(
-    *, guild_id: str, name: str, icon_hash: str | None = None
-) -> None:
+def upsert_bot_guild(*, guild_id: str, name: str, icon_hash: str | None = None) -> None:
     """Insert or refresh the bot_guilds registry row for a guild."""
     conn = connect()
     try:
@@ -153,9 +148,7 @@ def list_bot_guilds() -> list[dict[str, Any]]:
     """All guilds the bot is currently registered in, oldest-first."""
     conn = connect()
     try:
-        rows = conn.execute(
-            "SELECT * FROM bot_guilds ORDER BY joined_at ASC"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM bot_guilds ORDER BY joined_at ASC").fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -164,9 +157,7 @@ def list_bot_guilds() -> list[dict[str, Any]]:
 def get_bot_guild(guild_id: str) -> dict[str, Any] | None:
     conn = connect()
     try:
-        row = conn.execute(
-            "SELECT * FROM bot_guilds WHERE guild_id = ?", (guild_id,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM bot_guilds WHERE guild_id = ?", (guild_id,)).fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
@@ -221,6 +212,28 @@ def link_submission_to_event(
             (submission_id, event_id, 1 if is_primary else 0),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def get_submission_events(*, submission_id: int, guild_id: str) -> list[dict[str, Any]]:
+    """Return every event linked to a guild-scoped submission, primary first."""
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT e.id, e.name, e.kind, se.is_primary, se.linked_at
+              FROM submission_events se
+              JOIN submissions s ON s.id = se.submission_id
+              JOIN events e ON e.id = se.event_id
+             WHERE se.submission_id = ?
+               AND s.guild_id = ?
+               AND e.guild_id = ?
+             ORDER BY se.is_primary DESC, se.linked_at ASC, e.id ASC
+            """,
+            (submission_id, guild_id, guild_id),
+        ).fetchall()
+        return [dict(row) for row in rows]
     finally:
         conn.close()
 
@@ -402,6 +415,16 @@ def insert_submission(
         conn.close()
 
 
+def list_all_submission_message_ids() -> list[str]:
+    """Return every message_id in the submissions table (for backfill dedup)."""
+    conn = connect()
+    try:
+        rows = conn.execute("SELECT message_id FROM submissions").fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
 def is_admin(discord_user_id: str) -> bool:
     """True if the user is on the dashboard/debug allowlist."""
     conn = connect()
@@ -527,8 +550,14 @@ def update_event(
              WHERE id = ?
             """,
             (
-                kind, name, prompt, starts_at, ends_at,
-                primary_metric, nag_threshold_days, event_id,
+                kind,
+                name,
+                prompt,
+                starts_at,
+                ends_at,
+                primary_metric,
+                nag_threshold_days,
+                event_id,
             ),
         )
         conn.commit()
@@ -619,9 +648,7 @@ def list_submissions(
         # Hide rows where vision explicitly said this is not a workout.
         # Rows with NULL extracted_stats or a missing key stay visible —
         # only the definitively-not-workout images get filtered out.
-        where.append(
-            "COALESCE(json_extract(s.extracted_stats, '$.is_workout_screenshot'), 1) = 1"
-        )
+        where.append("COALESCE(json_extract(s.extracted_stats, '$.is_workout_screenshot'), 1) = 1")
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     params.append(limit)
 
@@ -678,8 +705,8 @@ def list_recent_submissions_by_user(
         conn.close()
 
 
-def get_submission(submission_id: int) -> dict[str, Any] | None:
-    """One submission joined with user + event context, or None."""
+def get_submission(submission_id: int, *, guild_id: str) -> dict[str, Any] | None:
+    """One guild-scoped submission joined with user + primary event context."""
     conn = connect()
     try:
         row = conn.execute(
@@ -694,9 +721,9 @@ def get_submission(submission_id: int) -> dict[str, Any] | None:
               FROM submissions s
               LEFT JOIN users u ON u.discord_user_id = s.discord_user_id
               LEFT JOIN events e ON e.id = s.event_id
-             WHERE s.id = ?
+             WHERE s.id = ? AND s.guild_id = ?
             """,
-            (submission_id,),
+            (submission_id, guild_id),
         ).fetchone()
         return dict(row) if row else None
     finally:
@@ -704,9 +731,9 @@ def get_submission(submission_id: int) -> dict[str, Any] | None:
 
 
 def update_submission_status(
-    submission_id: int, *, status: str, reviewed_by: str
+    submission_id: int, *, guild_id: str, status: str, reviewed_by: str
 ) -> None:
-    """Flip a submission's status. Records reviewer + timestamp."""
+    """Flip a guild-scoped submission's status and record its reviewer."""
     if status not in ("pending", "approved", "rejected"):
         raise ValueError(f"invalid status {status!r}")
     conn = connect()
@@ -715,13 +742,13 @@ def update_submission_status(
             """
             UPDATE submissions
                SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
-             WHERE id = ?
+             WHERE id = ? AND guild_id = ?
             """,
-            (status, reviewed_by, submission_id),
+            (status, reviewed_by, submission_id, guild_id),
         )
         conn.commit()
         if cur.rowcount == 0:
-            raise LookupError(f"submission {submission_id} not found")
+            raise LookupError(f"submission {submission_id} not found in guild {guild_id}")
     finally:
         conn.close()
 
@@ -730,18 +757,21 @@ def update_submission_after_clarification(
     submission_id: int,
     *,
     status: str,
-    event_id: int | None,
+    event_ids: list[int],
     extracted_stats: Mapping[str, Any],
     reviewed_by: str = "bot",
 ) -> None:
-    """Finalize a pending submission after clarification.
+    """Finalize a pending submission and atomically replace its event links.
 
-    Updates status, event_id (may change based on new understanding),
-    and extracted_stats (may change if vision re-interpreted the batch).
-    Marks reviewed_at.
+    The ordered ``event_ids`` list defines the primary event. Replacing
+    tentative links prevents an earlier interpretation from continuing to
+    score after the member clarifies the workout.
     """
     if status not in ("pending", "approved", "rejected"):
         raise ValueError(f"invalid status {status!r}")
+    if len(event_ids) != len(set(event_ids)):
+        raise ValueError("event_ids must not contain duplicates")
+    primary_event_id = event_ids[0] if event_ids else None
     conn = connect()
     try:
         cur = conn.execute(
@@ -753,15 +783,29 @@ def update_submission_after_clarification(
             """,
             (
                 status,
-                event_id,
+                primary_event_id,
                 json.dumps(extracted_stats),
                 reviewed_by,
                 submission_id,
             ),
         )
-        conn.commit()
         if cur.rowcount == 0:
             raise LookupError(f"submission {submission_id} not found")
+        conn.execute(
+            "DELETE FROM submission_events WHERE submission_id = ?",
+            (submission_id,),
+        )
+        conn.executemany(
+            """
+            INSERT INTO submission_events (submission_id, event_id, is_primary)
+            VALUES (?, ?, ?)
+            """,
+            [
+                (submission_id, event_id, 1 if index == 0 else 0)
+                for index, event_id in enumerate(event_ids)
+            ],
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -782,9 +826,7 @@ def reset_event(event_id: int) -> dict[str, Any]:
                 (event_id,),
             )
         ]
-        sub_count = conn.execute(
-            "DELETE FROM submissions WHERE event_id = ?", (event_id,)
-        ).rowcount
+        sub_count = conn.execute("DELETE FROM submissions WHERE event_id = ?", (event_id,)).rowcount
         metrics_count = conn.execute(
             "DELETE FROM event_metrics WHERE event_id = ?", (event_id,)
         ).rowcount
@@ -807,9 +849,7 @@ def delete_event(event_id: int) -> dict[str, Any]:
     result = reset_event(event_id)
     conn = connect()
     try:
-        row_count = conn.execute(
-            "DELETE FROM events WHERE id = ?", (event_id,)
-        ).rowcount
+        row_count = conn.execute("DELETE FROM events WHERE id = ?", (event_id,)).rowcount
         conn.commit()
     finally:
         conn.close()
@@ -821,8 +861,7 @@ def list_admins() -> list[dict[str, Any]]:
     """All admins joined with cached user identity, newest first."""
     conn = connect()
     try:
-        rows = conn.execute(
-            """
+        rows = conn.execute("""
             SELECT a.*,
                    u.username AS user_username,
                    u.display_name AS user_display_name,
@@ -830,8 +869,7 @@ def list_admins() -> list[dict[str, Any]]:
               FROM admins a
               LEFT JOIN users u ON u.discord_user_id = a.discord_user_id
              ORDER BY a.added_at DESC
-            """
-        ).fetchall()
+            """).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -860,9 +898,7 @@ def remove_admin(discord_user_id: str) -> None:
         ).fetchone()[0]
         if remaining == 0:
             raise ValueError("cannot remove the last admin")
-        cur = conn.execute(
-            "DELETE FROM admins WHERE discord_user_id = ?", (discord_user_id,)
-        )
+        cur = conn.execute("DELETE FROM admins WHERE discord_user_id = ?", (discord_user_id,))
         conn.commit()
         if cur.rowcount == 0:
             raise LookupError(f"admin {discord_user_id} not found")
@@ -931,9 +967,7 @@ def list_bot_event_categories() -> list[str]:
     """Distinct categories present in bot_events, for filter dropdowns."""
     conn = connect()
     try:
-        rows = conn.execute(
-            "SELECT DISTINCT category FROM bot_events ORDER BY category"
-        ).fetchall()
+        rows = conn.execute("SELECT DISTINCT category FROM bot_events ORDER BY category").fetchall()
         return [r["category"] for r in rows]
     finally:
         conn.close()
@@ -951,9 +985,7 @@ def list_bot_event_categories() -> list[str]:
 def get_global_setting(key: str) -> str | None:
     conn = connect()
     try:
-        row = conn.execute(
-            "SELECT value FROM global_settings WHERE key = ?", (key,)
-        ).fetchone()
+        row = conn.execute("SELECT value FROM global_settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
     finally:
         conn.close()
@@ -1034,9 +1066,7 @@ def get_guild_settings(guild_id: str, prefix: str = "") -> dict[str, str]:
         conn.close()
 
 
-def upsert_guild_setting(
-    *, guild_id: str, key: str, value: str, updated_by: str
-) -> None:
+def upsert_guild_setting(*, guild_id: str, key: str, value: str, updated_by: str) -> None:
     conn = connect()
     try:
         conn.execute(
@@ -1055,9 +1085,7 @@ def upsert_guild_setting(
         conn.close()
 
 
-def upsert_guild_settings(
-    guild_id: str, values: Mapping[str, str], *, updated_by: str
-) -> None:
+def upsert_guild_settings(guild_id: str, values: Mapping[str, str], *, updated_by: str) -> None:
     conn = connect()
     try:
         conn.executemany(
@@ -1169,9 +1197,7 @@ def get_event_summary(event_id: int) -> dict[str, Any] | None:
     """Return an event row plus derived counts for the dashboard summary card."""
     conn = connect()
     try:
-        event = conn.execute(
-            "SELECT * FROM events WHERE id = ?", (event_id,)
-        ).fetchone()
+        event = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
         if event is None:
             return None
         counts = conn.execute(
@@ -1524,9 +1550,7 @@ def has_reminder_been_sent(*, event_id: int, kind: str) -> bool:
         conn.close()
 
 
-def refresh_guild_cache(
-    guild_id: str, kind: str, entries: list[dict[str, Any]]
-) -> tuple[int, int]:
+def refresh_guild_cache(guild_id: str, kind: str, entries: list[dict[str, Any]]) -> tuple[int, int]:
     """Replace ``kind`` rows for ``guild_id`` with the supplied entries.
 
     ``entries`` is a list of ``{"id": str, "name": str, "position": int}``.
@@ -1602,8 +1626,7 @@ def mark_reminder_sent(*, event_id: int, kind: str, posted: bool = True) -> None
     conn = connect()
     try:
         conn.execute(
-            "INSERT OR IGNORE INTO event_reminders (event_id, kind, posted) "
-            "VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO event_reminders (event_id, kind, posted) " "VALUES (?, ?, ?)",
             (event_id, kind, 1 if posted else 0),
         )
         conn.commit()

@@ -1,6 +1,6 @@
 ---
 inclusion: fileMatch
-fileMatchPattern: '**/*'
+fileMatchPattern: 'discord_bot_fitness_challenge/**/*'
 ---
 
 # Dashboard
@@ -62,7 +62,8 @@ Browser → /auth/login  → generate random state, stash in session,
 Discord  → /auth/callback?code&state
                         → verify state, exchange code for token
                         → GET /users/@me, /users/@me/guilds
-                        → require membership in bound guild AND row in admins
+                        → require the user to admin at least one bot_guilds guild
+                          AND be the developer OR have a row in admins
                         → set session cookie, upsert into users table
                         → 302 → /
 ```
@@ -195,6 +196,20 @@ resolve the file path from the `submissions.image_path` column (never
 from a query parameter), and MUST verify the resolved file is under
 `config.FCB_SCREENSHOTS_DIR` before returning it. This prevents path
 traversal even if the DB is somehow corrupted.
+
+## Submission Attribution And Tenant Scope
+
+Submission list and detail pages treat `submission_events` as the source
+of truth for challenge attribution. They render every linked event and
+mark the primary event when a submission has multiple links. The neutral
+label **Attributions** applies to all statuses: only approved submissions
+contribute to event scoring.
+
+Every submission list, detail, status mutation, and evidence-image read
+MUST include the dashboard session's `current_guild_id`. A bare submission
+ID never authorizes access. Event filters also query through
+`submission_events`, so secondary attributions remain visible and
+filterable.
 
 ## Rate Limiting Considerations
 

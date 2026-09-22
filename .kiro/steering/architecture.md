@@ -1,6 +1,6 @@
 ---
 inclusion: fileMatch
-fileMatchPattern: '**/*'
+fileMatchPattern: 'discord_bot_fitness_challenge/**/*'
 ---
 
 # Architecture
@@ -58,7 +58,8 @@ dashboard re-runs vision on an admin's request).
 - Discord Interactions HTTP endpoint is NOT used. Slash commands
   (`/ping`, `/status`, `/list`, `/leaderboard`, `/debug`) and the
   message context menu (`Describe`) are registered against the gateway
-  and synced to the bound guild at process startup.
+  and synced globally at process startup so they resolve in every
+  guild the bot serves.
 
 ## Data Store
 
@@ -102,8 +103,9 @@ The bot's response to a non-recognized image is controlled by the hot
 setting `bot.reply_only_on_challenge_match` (default `true`).
 
 An image is "recognized" when `is_workout_screenshot` is true AND at
-least one active event matched via the single-event fast path or the
-router. Recognized images always get the coach-voice acknowledgement.
+least one active event matches through the router. Recognized images
+always get the coach-voice acknowledgement plus a deterministic list of
+every challenge credited to each approved submission.
 
 When `bot.reply_only_on_challenge_match = true` (default): every
 non-recognized outcome is silent in the channel. The screenshot still
@@ -159,24 +161,28 @@ doing 5×24 at the same weight contributes exactly 2× the volume of a
 
 ## Multi-Event Attribution
 
-More than one event MAY be active at the same time in the bound channel
-(e.g. a monthly elevation challenge overlapping a daily 1% cardio
-routine). The bot handles this via a many-to-many junction table
+More than one event MAY be active at the same time in a given guild's
+configured channel (e.g. a monthly elevation challenge overlapping a
+daily 1% cardio routine). The bot handles this via a many-to-many
+junction table
 `submission_events(submission_id, event_id, is_primary)`:
 
 - Aggregate reads (leaderboard, home page, `/status`, participant list)
   MUST go through `submission_events`. Reading `submissions.event_id`
   alone will miss secondary attributions.
 - `submissions.event_id` is retained as the "primary event" (first in
-  the router's ordered match list). It drives the reply framing and the
-  submission-detail page header.
-- When exactly one event is active, the router is NOT invoked; the
-  submission is linked to that single event.
-- When two or more are active, the `router` agent decides which subset
-  (possibly all, possibly none) a submission counts toward.
-- On router failure the bot falls back to attributing the submission to
-  every active event so the data isn't lost, and logs an ERROR row
-  (`router.failed`) so it surfaces in the logs panel.
+  the router's ordered match list). It frames generated coach voice;
+  Discord acknowledgements and dashboard submission views list every
+  linked event from `submission_events`, marking the primary when more
+  than one link exists.
+- The `router` agent evaluates every workout against every active event,
+  including when only one event is active, and returns the ordered subset
+  (possibly all, possibly none) that the submission clearly satisfies.
+- Router failure fails closed: no event receives uncertain credit, and an
+  ERROR row (`router.failed`) records the failure for dashboard review.
+- Clarification finalization replaces the submission's tentative event
+  links in the same transaction as its status and extracted stats update;
+  stale pre-clarification links never remain eligible for scoring.
 
 `event_participants` is auto-populated by SQLite triggers whenever a
 submission is linked to an event (and the submission is `approved`), or

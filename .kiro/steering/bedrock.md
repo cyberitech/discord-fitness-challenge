@@ -1,6 +1,6 @@
 ---
 inclusion: fileMatch
-fileMatchPattern: '**/*'
+fileMatchPattern: 'discord_bot_fitness_challenge/**/*'
 ---
 
 # Bedrock and Strands

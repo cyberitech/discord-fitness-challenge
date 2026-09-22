@@ -14,7 +14,7 @@ import re
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Any, Callable
 
 import discord
 import imagehash
@@ -354,6 +354,28 @@ def _summarize_stats(stats: WorkoutStats) -> str:
     if not parts:
         return "no stats extracted"
     return " · ".join(parts)
+
+
+def _summarize_event_credits(
+    approved: list[dict[str, Any]], events_by_id: dict[int, dict[str, Any]]
+) -> str:
+    """Render every credited event deterministically for a Discord footer."""
+
+    def event_names(record: dict[str, Any]) -> str:
+        names: list[str] = []
+        event_ids = record["matched_event_ids"]
+        for index, event_id in enumerate(event_ids):
+            event = events_by_id.get(event_id)
+            raw_name = str(event["name"]) if event else f"event #{event_id}"
+            safe_name = discord.utils.escape_mentions(discord.utils.escape_markdown(raw_name))
+            if len(event_ids) > 1 and index == 0:
+                safe_name += " (primary)"
+            names.append(safe_name)
+        return ", ".join(names)
+
+    if len(approved) == 1:
+        return f"Counts toward: {event_names(approved[0])}"
+    return " · ".join(f"#{record['submission_id']}: {event_names(record)}" for record in approved)
 
 
 class FCBClient(discord.Client):
@@ -2548,7 +2570,13 @@ class FCBClient(discord.Client):
                 f"submissions #{', #'.join(str(s) for s in sub_ids)}"
             )
 
-        await message.reply(f"<@{author_id}> {voice_line}\n-# {footer}")
+        credit_summary = _summarize_event_credits(approved, matched_by_id)
+        await message.reply(
+            f"<@{author_id}> {voice_line}\n-# {footer}\n-# {credit_summary}",
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, users=True, roles=False, replied_user=False
+            ),
+        )
 
         await asyncio.to_thread(
             dao.record_event,
@@ -2678,27 +2706,20 @@ class FCBClient(discord.Client):
                         )
                         matched_event_ids = decision.matched_event_ids
                     except Exception as e:
+                        logger.error(traceback.format_exc())
                         logger.error(f"router failed on clarification re-run for #{sid}: {e}")
 
                 recognized = session.is_workout_screenshot and bool(matched_event_ids)
                 new_status = "approved" if recognized else "rejected"
-                primary_event_id = matched_event_ids[0] if matched_event_ids else None
 
                 await asyncio.to_thread(
                     dao.update_submission_after_clarification,
                     submission_id=sid,
                     status=new_status,
-                    event_id=primary_event_id,
+                    event_ids=matched_event_ids,
                     extracted_stats=session.model_dump(),
                     reviewed_by="bot",
                 )
-                for i, eid in enumerate(matched_event_ids):
-                    await asyncio.to_thread(
-                        dao.link_submission_to_event,
-                        submission_id=sid,
-                        event_id=eid,
-                        is_primary=(i == 0),
-                    )
                 finalized.append(
                     {
                         "submission_id": sid,
@@ -2716,7 +2737,7 @@ class FCBClient(discord.Client):
                     dao.update_submission_after_clarification,
                     submission_id=extra["id"],
                     status="rejected",
-                    event_id=None,
+                    event_ids=[],
                     extracted_stats={
                         "is_workout_screenshot": False,
                         "notes": "merged into another session after clarification",
@@ -2793,7 +2814,13 @@ class FCBClient(discord.Client):
                     f"{len(approved)} sessions logged \u00b7 "
                     f"submissions #{', #'.join(str(s) for s in sub_ids)}"
                 )
-            await message.reply(f"<@{author_id}> {voice_line}\n-# {footer}")
+            credit_summary = _summarize_event_credits(approved, matched_by_id)
+            await message.reply(
+                f"<@{author_id}> {voice_line}\n-# {footer}\n-# {credit_summary}",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, users=True, roles=False, replied_user=False
+                ),
+            )
 
 
 def run() -> None:
