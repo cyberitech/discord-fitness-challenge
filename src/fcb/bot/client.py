@@ -23,8 +23,13 @@ from discord.ext import tasks
 from PIL import Image
 
 from fcb import config, runtime_config
+from fcb.agents import owner as owner_agent
 from fcb.agents import router, vision, voice
 from fcb.agents.vision import WorkoutStats
+from fcb.bingo import card_image as bingo_card
+from fcb.bingo import matching as bingo_matching
+from fcb.bingo import scoring as bingo_scoring
+from fcb.bingo import store as bingo_store
 from fcb.db import dao
 
 logger = logging.getLogger(__name__)
@@ -98,6 +103,16 @@ def _sniff_image_format(image_bytes: bytes) -> str | None:
     if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
         return "webp"
     return None
+
+
+# File extension -> Bedrock image format, for screenshots re-read from disk.
+_STORED_IMAGE_FORMATS = {
+    ".jpg": "jpeg",
+    ".jpeg": "jpeg",
+    ".png": "png",
+    ".gif": "gif",
+    ".webp": "webp",
+}
 
 
 def _downsize_image(image_bytes: bytes, image_format: str) -> tuple[bytes, str]:
@@ -457,6 +472,41 @@ class FCBClient(discord.Client):
             await interaction.response.send_message("FitnessBot up and healthy!")
 
         @self.tree.command(
+            name="bingo",
+            description="Show your fitness bingo card.",
+        )
+        async def bingo(interaction: discord.Interaction) -> None:
+            guild_id = await self._guild_id_or_reject(interaction)
+            if guild_id is None:
+                return
+            if await self._wrong_channel_reject(interaction, guild_id):
+                return
+            active = await asyncio.to_thread(dao.list_active_events, guild_id)
+            bingo_ids = await asyncio.to_thread(bingo_store.get_bingo_event_ids, guild_id)
+            event = next((e for e in active if int(e["id"]) in bingo_ids), None)
+            if event is None:
+                await interaction.response.send_message(
+                    "No bingo challenge is active right now.", ephemeral=True
+                )
+                return
+            await interaction.response.defer(thinking=True)
+            uid = str(interaction.user.id)
+            name = event.get("name") or "Fitness Bingo"
+            board = await asyncio.to_thread(bingo_store.member_board_state, int(event["id"]), uid, name)
+            rank = await asyncio.to_thread(bingo_store.member_rank, int(event["id"]), uid)
+            images = await asyncio.to_thread(
+                bingo_card.render_board_images, board, interaction.user.display_name
+            )
+            files = [discord.File(io.BytesIO(b), filename=n) for n, b in images]
+            total = board["total"]
+            summary = f"{total} pts total" + (f", rank #{rank}" if rank else "")
+            logger.info(f"/bingo for {interaction.user} on event {event['id']}")
+            await interaction.followup.send(
+                content=f"Here\u2019s your bingo card \u2014 {summary}:",
+                files=files,
+            )
+
+        @self.tree.command(
             name="status",
             description="Show your progress across the active challenges (or someone else's).",
         )
@@ -692,9 +742,24 @@ class FCBClient(discord.Client):
                 return
 
             per_event_limit = 10 if len(active_events) == 1 else 5
+            bingo_ids = await asyncio.to_thread(bingo_store.get_bingo_event_ids, guild_id)
             sections: list[str] = []
             total_entries = 0
             for event in active_events:
+                # Bingo challenges are ranked by points, not submission count.
+                if int(event["id"]) in bingo_ids:
+                    rows = await asyncio.to_thread(bingo_store.leaderboard_rows, int(event["id"]))
+                    blines = [f"**Leaderboard — {event['name']}**", "-# ranked by bingo points"]
+                    if not rows:
+                        blines.append("_No points scored yet._")
+                    else:
+                        medals = {1: "\U0001f947", 2: "\U0001f948", 3: "\U0001f949"}
+                        for r in rows[:per_event_limit]:
+                            mark = medals.get(r["rank"], f"`{r['rank']:>2}.`")
+                            blines.append(f"{mark} **{r['name']}** \u2014 {r['total']} pts")
+                    sections.append("\n".join(blines))
+                    total_entries += len(rows)
+                    continue
                 board = await asyncio.to_thread(
                     dao.get_event_leaderboard, event["id"], per_event_limit
                 )
@@ -1749,6 +1814,15 @@ class FCBClient(discord.Client):
 
         # Reply to a bot clarification question?
         if message.reference and message.reference.message_id:
+            # Bingo questions first: a bingo check-in can be approved (some squares
+            # crossed) with a question still open, so the pending-only lookup below
+            # would miss it, and its re-check is bingo matching, not vision.
+            bingo_sub = await asyncio.to_thread(
+                bingo_store.find_open_clarification, str(message.reference.message_id)
+            )
+            if bingo_sub is not None and bingo_sub["discord_user_id"] == author_id:
+                await self._handle_bingo_clarification_reply(guild_id, message, bingo_sub)
+                return
             pending_subs = await asyncio.to_thread(
                 dao.get_submissions_by_clarification_message,
                 str(message.reference.message_id),
@@ -1789,10 +1863,12 @@ class FCBClient(discord.Client):
         invoker_id = str(message.author.id)
         assert self.user is not None
 
-        remaining = self._llm_cooldown.check_and_stamp(guild_id, invoker_id)
-        if remaining is not None:
-            await _notify_rate_limited_privately(message, remaining)
-            return
+        is_owner = owner_agent.is_owner(invoker_id)
+        if not is_owner:  # the owner is exempt from the LLM cooldown
+            remaining = self._llm_cooldown.check_and_stamp(guild_id, invoker_id)
+            if remaining is not None:
+                await _notify_rate_limited_privately(message, remaining)
+                return
 
         # Strip both the formal mention (<@ID>) and text-fallback @BotName so
         # the LLM only sees the actual question.
@@ -1800,6 +1876,68 @@ class FCBClient(discord.Client):
         for name in self._bot_names_lower(message):
             question = re.sub(rf"@{re.escape(name)}", "", question, flags=re.IGNORECASE)
         question = question.strip()
+
+        # If a bingo challenge is active and they're asking about it, answer with the
+        # board image instead of persona prose.
+        try:
+            active_now = await asyncio.to_thread(dao.list_active_events, guild_id)
+            bingo_ids = await asyncio.to_thread(bingo_store.get_bingo_event_ids, guild_id)
+            bingo_event = next((e for e in active_now if int(e["id"]) in bingo_ids), None)
+        except Exception:
+            logger.error(traceback.format_exc())
+            bingo_event = None
+        # The owner's requests are open-ended (swap a square, regrade, look up someone),
+        # so only plain short asks use the canned board/leaderboard shortcuts; anything
+        # else goes to the chat agent, which has the owner tools.
+        if is_owner and (
+            len(question.split()) > 6
+            or any(not u.bot and u.id != message.author.id for u in message.mentions)
+        ):
+            bingo_event = None
+        if bingo_event is not None and re.search(
+            r"\b(leaderboard|standings?|rankings?|first place|who.?s winning|top \d+)\b",
+            question,
+            re.IGNORECASE,
+        ):
+            rows = await asyncio.to_thread(bingo_store.leaderboard_rows, int(bingo_event["id"]))
+            name = bingo_event.get("name") or "Fitness Bingo"
+            lines = [f"**{name} \u2014 leaderboard**", "-# ranked by bingo points"]
+            if not rows:
+                lines.append("_No points scored yet._")
+            else:
+                medals = {1: "\U0001f947", 2: "\U0001f948", 3: "\U0001f949"}
+                for r in rows[:10]:
+                    mark = medals.get(r["rank"], f"`{r['rank']:>2}.`")
+                    lines.append(f"{mark} **{r['name']}** \u2014 {r['total']} pts")
+            await message.reply("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
+            return
+        # Questions about the rules ("how many points is a blackout?") go to the chat
+        # agent, which has the generated scoring rules; only card/progress asks get the
+        # canned board image.
+        pattern_names = "|".join(
+            re.escape(label) for label in bingo_scoring.PATTERN_LABELS.values()
+        )
+        asks_rules = re.search(
+            rf"\b(rules?|worth|bonus(es)?|explain|scoring|how (does|do)|points? (for|is|are)"
+            rf"|{pattern_names})\b",
+            question,
+            re.IGNORECASE,
+        )
+        if bingo_event is not None and not asks_rules and re.search(
+            r"\b(bingo|card|cards|board|scorecard|status|progress)\b",
+            question,
+            re.IGNORECASE,
+        ):
+            board = await asyncio.to_thread(
+                bingo_store.member_board_state,
+                int(bingo_event["id"]),
+                invoker_id,
+                bingo_event.get("name") or "Fitness Bingo",
+            )
+            await self._send_bingo_card(
+                message, board, invoker_id, message.author.display_name, "here\u2019s your bingo card:"
+            )
+            return
         if not question:
             question = "(no question, just a hello)"
 
@@ -1914,10 +2052,29 @@ class FCBClient(discord.Client):
                 seen_ids.add(u.id)
                 target_users.append(u)
 
+            # Bingo challenges are scored in points from board patterns, so their
+            # snapshot and leaderboard rows carry points instead of submission counts.
+            chat_bingo_ids = await asyncio.to_thread(bingo_store.get_bingo_event_ids, guild_id)
             user_snapshots: list[dict[str, object]] = []
             for u in target_users:
                 per_event: list[dict[str, object]] = []
                 for event in active_events:
+                    if int(event["id"]) in chat_bingo_ids:
+                        bingo_board = await asyncio.to_thread(
+                            bingo_store.member_board_state,
+                            int(event["id"]),
+                            str(u.id),
+                            event["name"],
+                        )
+                        per_event.append(
+                            {
+                                "event_name": event["name"],
+                                "primary_metric_label": "bingo points",
+                                "primary_value": f"{bingo_board['total']} pts",
+                                "bingo": bingo_store.board_summary(bingo_board),
+                            }
+                        )
+                        continue
                     progress = await asyncio.to_thread(
                         dao.get_user_event_progress,
                         event_id=event["id"],
@@ -1957,6 +2114,25 @@ class FCBClient(discord.Client):
             # "what's the leaderboard" queries have real data to reference.
             leaderboards: list[dict[str, object]] = []
             for event in active_events:
+                if int(event["id"]) in chat_bingo_ids:
+                    bingo_rows = await asyncio.to_thread(
+                        bingo_store.leaderboard_rows, int(event["id"])
+                    )
+                    leaderboards.append(
+                        {
+                            "event_name": event["name"],
+                            "primary_metric_label": "bingo points",
+                            "entries": [
+                                {
+                                    "rank": r["rank"],
+                                    "display_name": r["name"],
+                                    "value": f"{r['total']} pts",
+                                }
+                                for r in bingo_rows[:10]
+                            ],
+                        }
+                    )
+                    continue
                 board = await asyncio.to_thread(dao.get_event_leaderboard, event["id"], 10)
                 metric = event["primary_metric"]
                 entries = [
@@ -2034,6 +2210,12 @@ class FCBClient(discord.Client):
                     invoker_recent_submissions=invoker_recent_submissions,
                     image_bytes=referenced_image_bytes,
                     image_format=referenced_image_format,
+                    invoker_id=invoker_id,
+                    bingo_rules=(
+                        bingo_scoring.rules_text()
+                        if any(int(e["id"]) in chat_bingo_ids for e in active_events)
+                        else None
+                    ),
                 )
             except Exception as e:
                 logger.error(traceback.format_exc())
@@ -2137,6 +2319,435 @@ class FCBClient(discord.Client):
             },
         )
 
+    async def _send_bingo_card(
+        self,
+        message: discord.Message,
+        board_state: dict,
+        user_id: str,
+        display_name: str,
+        lead: str,
+        footer: str = "",
+    ) -> discord.Message:
+        """Render the member's board and reply with it as an image attachment.
+
+        ``footer`` is appended after the points summary (used for a clarification
+        question). Returns the sent message.
+        """
+        event_id = int(board_state["event_id"])
+        rank = await asyncio.to_thread(bingo_store.member_rank, event_id, user_id)
+        images = await asyncio.to_thread(bingo_card.render_board_images, board_state, display_name)
+        files = [discord.File(io.BytesIO(b), filename=n) for n, b in images]
+        total = board_state["total"]
+        summary = f" ({total} pts total" + (f", rank #{rank}" if rank else "") + ")"
+        if files:
+            return await message.reply(
+                content=f"<@{user_id}> {lead}{summary}{footer}", files=files
+            )
+        return await message.reply(content=f"<@{user_id}> {lead}{footer}")
+
+    @staticmethod
+    def _bingo_crossed_lead(board_before: dict, board_after: dict, crossed: list[dict]) -> str:
+        """Describe newly crossed squares and any pattern bonus they unlocked."""
+        before_bonus = {c["card_key"]: c.get("bonus", 0) for c in board_before["cards"]}
+        new_patterns = [
+            f"{c['label']}: {bingo_scoring.PATTERN_LABELS[c['pattern']]} (+{c.get('bonus', 0)})"
+            for c in board_after["cards"]
+            if c["pattern"] and c.get("bonus", 0) > before_bonus.get(c["card_key"], 0)
+        ]
+        crossed_desc = "; ".join(
+            f"{bingo_scoring.CARD_LABELS[sq['card_key']]} \u2014 {sq['task']}" for sq in crossed
+        )
+        lead = f"crossed off {len(crossed)} square{'' if len(crossed) == 1 else 's'}! {crossed_desc}"
+        if new_patterns:
+            lead += "\n\U0001f389 **BINGO!** " + "; ".join(new_patterns)
+        return lead
+
+    async def _process_bingo_checkin(
+        self,
+        guild_id: str,
+        message: discord.Message,
+        saved: list[dict],
+        event: dict,
+        author_id: str,
+    ) -> None:
+        """Match a check-in against the member's open bingo squares and cross them off.
+
+        Bingo scores by board patterns, so this bypasses the summed-metric vision/router
+        path. It still records one submission (with the image hashes) so duplicate
+        detection and the dashboard evidence view keep working.
+        """
+        event_id = int(event["id"])
+        event_name = event.get("name") or "Fitness Bingo"
+        display_name = message.author.display_name
+
+        # The deterministic boards depend on a stable pool ordering, so freeze the pool on
+        # the first check-in (FCB events have no explicit "open" action).
+        await asyncio.to_thread(bingo_store.freeze_pool, event_id)
+
+        board_before = await asyncio.to_thread(
+            bingo_store.member_board_state, event_id, author_id, event_name
+        )
+        opens = bingo_store.open_squares(board_before)
+        if not opens:
+            await self._send_bingo_card(
+                message, board_before, author_id, display_name,
+                "every square on your board is already crossed — total blackout! \U0001f3c6",
+            )
+            return
+
+        caption = (message.content or "").strip() or None
+        downsized = [_downsize_image(s["bytes"], s["format"]) for s in saved]
+        async with message.channel.typing():
+            try:
+                result = await asyncio.to_thread(
+                    bingo_matching.match_bingo, downsized, opens, caption
+                )
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                logger.error(f"bingo matching failed for message {message.id}: {e}")
+                await asyncio.to_thread(
+                    dao.record_event,
+                    level="ERROR",
+                    category="bingo.match_failed",
+                    message=f"bingo matching failed for message {message.id}: {e}",
+                    actor=author_id,
+                    guild_id=guild_id,
+                    context={"message_id": str(message.id)},
+                )
+                await message.reply(
+                    f"<@{author_id}> I couldn\u2019t read that check-in clearly. "
+                    "Try again, or ping an admin to review it."
+                )
+                return
+
+        open_by_key = {sq["cell_key"]: sq for sq in opens}
+        candidates = [
+            bingo_scoring.AssignmentCandidate(
+                cell=m.cell_key,
+                activity_indices=m.activity_indices,
+                confidence=m.confidence,
+                reason=m.reason,
+            )
+            for m in result.matches
+            if m.cell_key in open_by_key
+        ]
+        chosen = bingo_scoring.solve_assignment(candidates, lambda c: str(c))
+
+        status = "approved" if chosen else ("pending" if result.needs_clarification else "rejected")
+        # A question is asked whenever the model has one, even if some squares were
+        # crossed (e.g. 7 clear, 1 ambiguous). The flag routes the member's reply to
+        # _handle_bingo_clarification_reply.
+        question = (result.clarification_question or "").strip()
+        asking = bool(result.needs_clarification and question)
+        submission_id = await asyncio.to_thread(
+            dao.insert_submission,
+            guild_id=guild_id,
+            event_id=event_id,
+            discord_user_id=author_id,
+            message_id=str(message.id),
+            channel_id=str(message.channel.id),
+            posted_at=message.created_at.isoformat(),
+            image_path=saved[0]["path"],
+            raw_text=message.content or None,
+            extracted_stats={
+                "bingo": True,
+                "activities": result.activities,
+                "crossed": [str(c.cell) for c in chosen],
+                "needs_clarification": result.needs_clarification,
+                "clarification_question": question if asking else None,
+                "clarification_open": asking,
+            },
+            status=status,
+        )
+        await asyncio.to_thread(
+            dao.insert_submission_images,
+            submission_id=submission_id,
+            images=[(s["path"], s["hash"]) for s in saved],
+        )
+        await asyncio.to_thread(
+            dao.link_submission_to_event,
+            submission_id=submission_id,
+            event_id=event_id,
+            is_primary=True,
+        )
+
+        crossed: list[dict] = []
+        for c in chosen:
+            sq = open_by_key[str(c.cell)]
+            newly = await asyncio.to_thread(
+                bingo_store.add_crossing,
+                event_id=event_id,
+                user_id=author_id,
+                card_key=sq["card_key"],
+                cell_index=sq["cell_index"],
+                task_id=sq["task_id"],
+                submission_id=submission_id,
+                reason=c.reason,
+            )
+            if newly:
+                crossed.append(sq)
+
+        await asyncio.to_thread(
+            dao.record_event,
+            level="INFO",
+            category="bingo.checkin",
+            message=(
+                f"{display_name} crossed {len(crossed)} square(s) on {event_name}"
+                if crossed
+                else f"{display_name} check-in matched no open squares on {event_name}"
+            ),
+            actor=author_id,
+            guild_id=guild_id,
+            context={
+                "message_id": str(message.id),
+                "event_id": event_id,
+                "crossed": [f"{sq['card_key']}:{sq['cell_index']}" for sq in crossed],
+                "needs_clarification": result.needs_clarification,
+            },
+        )
+
+        reply_hint = (
+            "\n-# Reply to this message to answer and I\u2019ll re-check those images."
+        )
+        sent: discord.Message
+        if not crossed:
+            if asking:
+                sent = await message.reply(f"<@{author_id}> {question}{reply_hint}")
+            else:
+                await self._send_bingo_card(
+                    message, board_before, author_id, display_name,
+                    "I logged that, but it didn\u2019t match any open square on your cards yet. "
+                    "Here\u2019s where you stand:",
+                )
+                return
+        else:
+            board_after = await asyncio.to_thread(
+                bingo_store.member_board_state, event_id, author_id, event_name
+            )
+            lead = self._bingo_crossed_lead(board_before, board_after, crossed)
+            footer = f"\n\u2753 One more question: {question}{reply_hint}" if asking else ""
+            sent = await self._send_bingo_card(
+                message, board_after, author_id, display_name, lead, footer
+            )
+            if not asking:
+                return
+
+        await asyncio.to_thread(dao.set_clarification_message_id, submission_id, str(sent.id))
+        await asyncio.to_thread(
+            dao.record_event,
+            level="INFO",
+            category="bingo.needs_clarification",
+            message=f"bingo check-in needs clarification: {question}",
+            actor=author_id,
+            guild_id=guild_id,
+            context={
+                "message_id": str(message.id),
+                "submission_id": submission_id,
+                "question": question,
+                "crossed": [f"{sq['card_key']}:{sq['cell_index']}" for sq in crossed],
+                "reasoning": result.reasoning,
+            },
+        )
+
+    async def _handle_bingo_clarification_reply(
+        self, guild_id: str, message: discord.Message, sub: dict
+    ) -> None:
+        """Re-check a bingo check-in after the member answers its clarification question.
+
+        Re-runs matching on the stored images with the question and answer. Squares the
+        check-in already crossed stay crossed, and the activities backing them can't be
+        reused, so the re-check can only add squares. One answer closes the question.
+        """
+        author_id = str(message.author.id)
+        display_name = message.author.display_name
+        answer = (message.content or "").strip()
+        if not answer:
+            return
+        submission_id = int(sub["id"])
+        event_id = int(sub["event_id"])
+        try:
+            stats = json.loads(sub["extracted_stats"]) if sub.get("extracted_stats") else {}
+        except json.JSONDecodeError:
+            stats = {}
+        question = str(stats.get("clarification_question") or "")
+
+        active = await asyncio.to_thread(dao.list_active_events, guild_id)
+        event = next((e for e in active if int(e["id"]) == event_id), None)
+        if event is None:
+            await message.reply(
+                f"<@{author_id}> that bingo challenge isn\u2019t running anymore, so I can\u2019t "
+                "re-check it. An admin can review it from the dashboard."
+            )
+            return
+        event_name = event.get("name") or "Fitness Bingo"
+
+        images: list[tuple[bytes, str]] = []
+        for img in await asyncio.to_thread(dao.get_submission_images, submission_id):
+            full_path = config.REPO_ROOT / img["image_path"]
+            if not full_path.exists():
+                await message.reply(
+                    f"<@{author_id}> one of the original screenshots is missing, so I can\u2019t "
+                    "re-check it. An admin can review it from the dashboard."
+                )
+                return
+            fmt = _STORED_IMAGE_FORMATS.get(full_path.suffix.lower(), "jpeg")
+            images.append(_downsize_image(full_path.read_bytes(), fmt))
+        if not images:
+            await message.reply(
+                f"<@{author_id}> I couldn\u2019t find the original images for that check-in. "
+                "An admin can review it from the dashboard."
+            )
+            return
+
+        board_before = await asyncio.to_thread(
+            bingo_store.member_board_state, event_id, author_id, event_name
+        )
+        opens = bingo_store.open_squares(board_before)
+        cells = {
+            (card["card_key"], cell["index"]): cell
+            for card in board_before["cards"]
+            if card["available"]
+            for cell in card["cells"]
+        }
+        credited = [
+            {
+                "cell_key": f"{p['card_key']}:{p['cell_index']}",
+                "card_key": p["card_key"],
+                "cell_index": int(p["cell_index"]),
+                "task": cells[(p["card_key"], int(p["cell_index"]))]["text"],
+            }
+            for p in await asyncio.to_thread(bingo_store.crossings_for_submission, submission_id)
+            if (p["card_key"], int(p["cell_index"])) in cells
+        ]
+
+        result: bingo_matching.BingoMatchResult | None = None
+        if opens:
+            async with message.channel.typing():
+                try:
+                    result = await asyncio.to_thread(
+                        bingo_matching.match_bingo,
+                        images,
+                        opens,
+                        sub.get("raw_text"),
+                        credited_squares=credited,
+                        clarification=(question, answer),
+                    )
+                except Exception as e:
+                    logger.error(traceback.format_exc())
+                    logger.error(f"bingo clarification re-check failed for {submission_id}: {e}")
+                    await asyncio.to_thread(
+                        dao.record_event,
+                        level="ERROR",
+                        category="bingo.match_failed",
+                        message=f"bingo clarification re-check failed for #{submission_id}: {e}",
+                        actor=author_id,
+                        guild_id=guild_id,
+                        context={"message_id": str(message.id), "submission_id": submission_id},
+                    )
+                    # The question stays open, so the member can reply again.
+                    await message.reply(
+                        f"<@{author_id}> something went wrong re-checking that. "
+                        "Reply to my question again, or ping an admin to review it."
+                    )
+                    return
+
+        # Squares this check-in already earned claim their activities first, so a new
+        # square can't be backed by an activity that already crossed one.
+        crossed: list[dict] = []
+        if result is not None:
+            credited_keys = {sq["cell_key"] for sq in credited}
+            open_by_key = {sq["cell_key"]: sq for sq in opens}
+
+            def _candidate(m: bingo_matching.BingoMatch) -> bingo_scoring.AssignmentCandidate:
+                return bingo_scoring.AssignmentCandidate(
+                    cell=m.cell_key,
+                    activity_indices=m.activity_indices,
+                    confidence=m.confidence,
+                    reason=m.reason,
+                )
+
+            pinned = bingo_scoring.solve_assignment(
+                [_candidate(m) for m in result.matches if m.cell_key in credited_keys],
+                lambda c: str(c),
+            )
+            used = {i for c in pinned for i in c.activity_indices}
+            chosen = bingo_scoring.solve_assignment(
+                [
+                    _candidate(m)
+                    for m in result.matches
+                    if m.cell_key in open_by_key and not used.intersection(m.activity_indices)
+                ],
+                lambda c: str(c),
+            )
+            for c in chosen:
+                sq = open_by_key[str(c.cell)]
+                newly = await asyncio.to_thread(
+                    bingo_store.add_crossing,
+                    event_id=event_id,
+                    user_id=author_id,
+                    card_key=sq["card_key"],
+                    cell_index=sq["cell_index"],
+                    task_id=sq["task_id"],
+                    submission_id=submission_id,
+                    reason=c.reason,
+                )
+                if newly:
+                    crossed.append(sq)
+
+        all_crossed = [sq["cell_key"] for sq in credited] + [
+            f"{sq['card_key']}:{sq['cell_index']}" for sq in crossed
+        ]
+        stats.update(
+            {
+                "crossed": all_crossed,
+                "clarification_open": False,
+                "clarification_answer": answer[:500],
+                "clarification_activities": result.activities if result else [],
+                "clarification_crossed": [
+                    f"{sq['card_key']}:{sq['cell_index']}" for sq in crossed
+                ],
+            }
+        )
+        await asyncio.to_thread(
+            bingo_store.update_submission_result,
+            submission_id,
+            status="approved" if all_crossed else "rejected",
+            extracted_stats=stats,
+        )
+        await asyncio.to_thread(
+            dao.record_event,
+            level="INFO",
+            category="bingo.clarification_resolved",
+            message=(
+                f"{display_name} answered a bingo question; crossed {len(crossed)} more "
+                f"square(s) on {event_name}"
+            ),
+            actor=author_id,
+            guild_id=guild_id,
+            context={
+                "message_id": str(message.id),
+                "submission_id": submission_id,
+                "answer": answer[:200],
+                "crossed": [f"{sq['card_key']}:{sq['cell_index']}" for sq in crossed],
+                "reasoning": result.reasoning if result else None,
+            },
+        )
+
+        if not crossed:
+            lead = (
+                "thanks! Your board is fully crossed already."
+                if not opens
+                else "thanks! I re-checked with your answer, but it didn\u2019t cross off "
+                "anything new. Here\u2019s where you stand:"
+            )
+            await self._send_bingo_card(message, board_before, author_id, display_name, lead)
+            return
+        board_after = await asyncio.to_thread(
+            bingo_store.member_board_state, event_id, author_id, event_name
+        )
+        lead = "thanks! " + self._bingo_crossed_lead(board_before, board_after, crossed)
+        await self._send_bingo_card(message, board_after, author_id, display_name, lead)
+
     async def _process_workout_images(
         self,
         guild_id: str,
@@ -2206,7 +2817,7 @@ class FCBClient(discord.Client):
                 if s["hash"] not in dup_map:
                     continue
                 original_id = dup_map[s["hash"]]
-                orig = await asyncio.to_thread(dao.get_submission, original_id)
+                orig = await asyncio.to_thread(dao.get_submission, original_id, guild_id=guild_id)
                 if (
                     orig is not None
                     and orig.get("guild_id")
@@ -2296,6 +2907,15 @@ class FCBClient(discord.Client):
                     submission_id=0,
                     reason="no_event",
                 )
+            return
+
+        # Bingo challenges score by board patterns, not summed metrics, so they take a
+        # dedicated path: match the screenshots against the member's open squares and
+        # cross them off. If a bingo challenge is active, handle the batch here.
+        bingo_event_ids = await asyncio.to_thread(bingo_store.get_bingo_event_ids, guild_id)
+        bingo_active = [e for e in active_events if int(e["id"]) in bingo_event_ids]
+        if bingo_active:
+            await self._process_bingo_checkin(guild_id, message, saved, bingo_active[0], author_id)
             return
 
         primary_hint = active_events[0]

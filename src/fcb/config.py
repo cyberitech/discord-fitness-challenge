@@ -56,6 +56,12 @@ DISCORD_OAUTH_CLIENT_SECRET: str = _required("DISCORD_OAUTH_CLIENT_SECRET")
 # to modify it (that's the point).
 FCB_DEVELOPER_USER_ID: str = _required("FCB_DEVELOPER_USER_ID")
 
+# The one Discord user (Mochi) the bot treats as its owner/administrator in chat:
+# special honorifics, requests are honored when possible, and no privacy limits on
+# discussing other members' tracked data. Identity is always the Discord user id,
+# never a display name. Override with FCB_OWNER_USER_ID if it ever changes.
+FCB_OWNER_USER_ID: str = _optional("FCB_OWNER_USER_ID", "1271241319699845276")
+
 # Bit sum of the Discord permissions FCB actually uses. View Channels
 # + Send Messages + Add Reactions + Embed Links + Attach Files +
 # Read Message History + Mention Everyone + Use Application Commands.
