@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 from strands import Agent
 from strands.types.content import ContentBlock
 
-from fcb.agents import bedrock_model, chat_model, owner
+from fcb.agents import bedrock_model, owner
 from fcb.db import dao
 
 logger = logging.getLogger(__name__)
@@ -928,7 +928,7 @@ def chat_reply(
         f"recent_submissions={len(invoker_recent_submissions) if invoker_recent_submissions else 0} "
         f"history_msgs={len(channel_history) if channel_history else 0}"
     )
-    agent = Agent(model=chat_model, system_prompt=system, tools=owner_tools or None)
+    agent = Agent(model=bedrock_model, system_prompt=system, tools=owner_tools or None)
     if image_bytes and image_format:
         message_content = [
             {"text": prompt},

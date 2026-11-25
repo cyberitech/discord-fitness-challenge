@@ -21,6 +21,7 @@ import imagehash
 from discord import app_commands
 from discord.ext import tasks
 from PIL import Image
+from strands.types.exceptions import MaxTokensReachedException
 
 from fcb import config, runtime_config
 from fcb.agents import owner as owner_agent
@@ -2275,8 +2276,15 @@ class FCBClient(discord.Client):
                     actor=invoker_id,
                     context={"message_id": str(message.id)},
                 )
+                if isinstance(e, MaxTokensReachedException):
+                    failure_reply = (
+                        "You made me think too hard and my head is hurting... "
+                        "ask me to do more simple things im not that smart"
+                    )
+                else:
+                    failure_reply = "Ran into an error answering that. Try again in a moment."
                 await message.reply(
-                    "Ran into an error answering that. Try again in a moment.",
+                    failure_reply,
                     mention_author=False,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
