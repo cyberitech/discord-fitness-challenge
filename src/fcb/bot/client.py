@@ -2282,6 +2282,43 @@ class FCBClient(discord.Client):
                 )
                 return
 
+            # A reply too long for one Discord message gets rewritten into a
+            # short version in the same voice. If that fails or is still too
+            # long, the original is posted split across messages instead.
+            original_reply: str | None = None
+            if len(reply_text) > _DISCORD_MESSAGE_LIMIT:
+                condensed = ""
+                try:
+                    condensed = await asyncio.to_thread(
+                        voice.condense_reply,
+                        guild_id=guild_id,
+                        question=question,
+                        reply=reply_text,
+                        channel_history=channel_history,
+                    )
+                except Exception as e:
+                    logger.error(traceback.format_exc())
+                    logger.error(f"condense_reply failed for message {message.id}: {e}")
+                if condensed and len(condensed) <= _DISCORD_MESSAGE_LIMIT:
+                    original_reply, reply_text = reply_text, condensed
+                else:
+                    logger.warning(
+                        f"condense_reply unusable for message {message.id} "
+                        f"(len={len(condensed)}); posting original split"
+                    )
+                    await asyncio.to_thread(
+                        dao.record_event,
+                        level="WARNING",
+                        category="chat.condense_failed",
+                        message="long chat reply could not be condensed; posted split",
+                        actor=invoker_id,
+                        context={
+                            "message_id": str(message.id),
+                            "original_len": len(reply_text),
+                            "condensed_len": len(condensed),
+                        },
+                    )
+
         await asyncio.to_thread(
             dao.record_event,
             level="INFO",
@@ -2294,6 +2331,8 @@ class FCBClient(discord.Client):
                 "reply": reply_text[:500],
                 "active_event_ids": [int(e["id"]) for e in active_events],
                 "history_messages": len(channel_history),
+                # Full pre-condense answer, kept so admins can see the detail.
+                "original_reply": original_reply,
             },
         )
 

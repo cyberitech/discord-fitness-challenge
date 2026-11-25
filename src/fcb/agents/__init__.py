@@ -22,6 +22,16 @@ bedrock_model = BedrockModel(
     model_id=config.BEDROCK_MODEL_ID,
 )
 
+# @-mention chat replies use adaptive thinking so the model's working stays in
+# hidden reasoning blocks instead of the posted text. max_tokens caps thinking
+# plus reply together, so it needs headroom beyond the visible answer.
+chat_model = BedrockModel(
+    region_name=config.AWS_REGION,
+    model_id=config.BEDROCK_MODEL_ID,
+    max_tokens=16000,
+    additional_request_fields={"thinking": {"type": "adaptive"}},
+)
+
 
 WORKOUT_DOMAIN_KNOWLEDGE = """\
 Shared workout domain knowledge — applies to every challenge regardless

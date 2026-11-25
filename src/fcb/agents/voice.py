@@ -14,12 +14,12 @@ Three modes:
 """
 
 import logging
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from strands import Agent
 from strands.types.content import ContentBlock
 
-from fcb.agents import bedrock_model, owner
+from fcb.agents import bedrock_model, chat_model, owner
 from fcb.db import dao
 
 logger = logging.getLogger(__name__)
@@ -928,7 +928,7 @@ def chat_reply(
         f"recent_submissions={len(invoker_recent_submissions) if invoker_recent_submissions else 0} "
         f"history_msgs={len(channel_history) if channel_history else 0}"
     )
-    agent = Agent(model=bedrock_model, system_prompt=system, tools=owner_tools or None)
+    agent = Agent(model=chat_model, system_prompt=system, tools=owner_tools or None)
     if image_bytes and image_format:
         message_content = [
             {"text": prompt},
@@ -942,3 +942,70 @@ def chat_reply(
         f"Not sure how to help with that, {invoker_display_name}. "
         f"I'm here for the fitness challenges — try /status or /list."
     )
+
+
+CONDENSE_INSTRUCTION = """\
+Situation: you already wrote a reply to a user's @-mention, but it is too \
+long for one Discord message. Rewrite it as a short, easy-to-digest \
+version that a person can read at a glance.
+
+Rules:
+- Keep the same voice, personality, quirks, and form of address as the \
+original reply (nicknames, honorifics, emoji style, jokes). It should read \
+like the same character wrote it, just tighter. The way the original \
+addresses the user was already approved for this user, so keep it even if \
+it seems to conflict with the persona's address rules above.
+- Lead with the answer or recommendation. Drop the working, the \
+step-by-step reasoning, the alternatives considered, and anything that \
+restates the question.
+- Keep every number, name, exercise, square/cell id, and score exactly \
+as written in the original. Do not round, merge, or recompute anything, \
+and do not add facts, numbers, or advice that are not in the original.
+- If the original confirms changes that were made (approved/rejected a \
+submission, changed a stat, crossed or uncrossed a square), every one of \
+those confirmations MUST stay in the rewrite.
+- Short bullet lists are fine when the answer is a plan or a list. No \
+headings, no tables, no code blocks.
+- Hard limit: under {max_chars} characters total.
+- Output only the rewritten reply, nothing else.
+"""
+
+
+def condense_reply(
+    *,
+    guild_id: str,
+    question: str,
+    reply: str,
+    channel_history: Sequence[Mapping[str, str]] | None = None,
+    max_chars: int = 1500,
+) -> str:
+    """Rewrite an over-long chat reply into a short version in the same voice.
+
+    Called by the bot when ``chat_reply`` output does not fit in one Discord
+    message. Gets the persona, the original question, the full reply, and a
+    small slice of channel history for tone, but none of the challenge data,
+    so it can only shorten what was said rather than redo the analysis.
+    Returns an empty string if the model produced no text.
+    """
+    s = get_voice_settings(guild_id)
+    system = s["voice.base_persona"] + "\n\n" + CONDENSE_INSTRUCTION.format(max_chars=max_chars)
+    history_block = ""
+    if channel_history:
+        history_lines = [
+            f"{h.get('author') or '?'}: {h.get('content') or ''}" for h in channel_history[-10:]
+        ]
+        history_block = (
+            "Recent channel messages (oldest first, for tone only):\n"
+            + "\n".join(history_lines)
+            + "\n\n"
+        )
+    prompt = (
+        f"{history_block}"
+        f"The user's question: {question!r}\n\n"
+        f"Your original reply ({len(reply)} characters):\n"
+        f"<original_reply>\n{reply}\n</original_reply>\n\n"
+        "Write the short version."
+    )
+    logger.info(f"voice.condense_reply original_len={len(reply)} max_chars={max_chars}")
+    agent = Agent(model=bedrock_model, system_prompt=system)
+    return _first_text(agent(prompt))
