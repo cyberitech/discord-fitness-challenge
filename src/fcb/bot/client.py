@@ -393,6 +393,53 @@ def _summarize_event_credits(
     return " · ".join(f"#{record['submission_id']}: {event_names(record)}" for record in approved)
 
 
+_DISCORD_MESSAGE_LIMIT = 2000  # Discord's per-message content cap for bots
+
+
+def _split_for_discord(text: str, limit: int = _DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """Split text into chunks that each fit in one Discord message.
+
+    Breaks on newlines where possible, falls back to the last space (or a
+    hard cut) for single lines longer than the limit, and closes/reopens
+    ``` code fences across chunk boundaries so each message renders cleanly.
+    """
+    if len(text) <= limit:
+        return [text]
+    # Reserve room for a closing "\n```" and a reopening "```\n".
+    budget = limit - 8
+    lines: list[str] = []
+    for line in text.split("\n"):
+        while len(line) > budget:
+            cut = line.rfind(" ", 0, budget)
+            if cut <= 0:
+                cut = budget
+            lines.append(line[:cut])
+            line = line[cut:].lstrip(" ")
+        lines.append(line)
+
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    in_fence = False
+    for line in lines:
+        added = len(line) + (1 if current else 0)
+        if current and size + added > budget:
+            body = "\n".join(current)
+            if in_fence:
+                body += "\n```"
+            chunks.append(body)
+            current = ["```"] if in_fence else []
+            size = 3 if in_fence else 0
+            added = len(line) + (1 if current else 0)
+        current.append(line)
+        size += added
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+    if current:
+        chunks.append("\n".join(current))
+    return [c for c in chunks if c.strip()]
+
+
 class FCBClient(discord.Client):
     """Gateway client bound to one guild and one channel."""
 
@@ -2250,13 +2297,18 @@ class FCBClient(discord.Client):
             },
         )
 
-        # Reply as a Discord reply so the author gets pinged naturally.
+        # Reply as a Discord reply so the author gets pinged naturally. Long
+        # answers are split across messages to stay under Discord's length cap;
+        # only the first chunk pings.
+        chunks = _split_for_discord(reply_text)
         await message.reply(
-            reply_text,
+            chunks[0],
             allowed_mentions=discord.AllowedMentions(
                 everyone=False, users=False, roles=False, replied_user=True
             ),
         )
+        for chunk in chunks[1:]:
+            await message.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
 
     async def _post_hardcore_riff(
         self,
