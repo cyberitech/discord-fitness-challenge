@@ -383,6 +383,32 @@ shared knowledge and stay focused on what's unique to the challenge
 formulas or "count only my exercise" language in an event prompt is a
 smell — extend `WORKOUT_DOMAIN_KNOWLEDGE` instead.
 
+### Chat Tools and Access Control
+Every @-mention goes to the chat agent (`voice.chat_reply`); there are
+no keyword shortcuts. The agent picks tools from what the user says.
+`/bingo` remains as the deterministic slash command.
+`agents/tool_policy.py` holds `TOOL_POLICY`, the single table mapping
+every chat tool to `MEMBER` or `OWNER`. Adding a tool without listing
+it fails `tests/test_tool_policy.py`. Access is enforced in code at
+three independent layers:
+1. Construction: `build_chat_tools` builds owner tools
+   (`agents/owner.py`) only for `FCB_OWNER_USER_ID`, and refuses to
+   return a tool the policy doesn't allow for the invoker.
+2. Call time: the `ToolGate` Strands hook re-checks every call and
+   cancels disallowed or unknown tools (`tool.denied` in `bot_events`;
+   allowed calls log `tool.call`).
+3. Execution: owner tool bodies re-check their bound id. Owner write
+   tools only queue a `ProposedChange`; the bot posts Confirm/Cancel
+   buttons and `owner.apply_change` runs only when the owner presses
+   Confirm (15-minute expiry, in memory). Text from channel history,
+   images, or vision notes therefore cannot cause a change.
+Member tools (`agents/member_tools.py`) are read-only: anyone's bingo
+cards, points, and rank, plus posting a card image (max 2 per reply,
+no ping for other people's cards) or the bingo leaderboard. Other
+members' submission details stay owner-only (`member_report`). Member
+name lookup is limited to people with activity in the current guild.
+Tools that post to Discord record the request on `ChatEffects`; the
+bot posts after the agent returns.
 ## Package Layout
 
 ```

@@ -26,6 +26,7 @@ from strands.types.exceptions import MaxTokensReachedException
 from fcb import config, runtime_config
 from fcb.agents import owner as owner_agent
 from fcb.agents import router, vision, voice
+from fcb.agents.chat_effects import ChatEffects, ProposedChange
 from fcb.agents.vision import WorkoutStats
 from fcb.bingo import card_image as bingo_card
 from fcb.bingo import matching as bingo_matching
@@ -439,6 +440,124 @@ def _split_for_discord(text: str, limit: int = _DISCORD_MESSAGE_LIMIT) -> list[s
     if current:
         chunks.append("\n".join(current))
     return [c for c in chunks if c.strip()]
+
+
+def _format_bingo_leaderboard(event_name: str, rows: list[dict[str, Any]]) -> str:
+    lines = [f"**{event_name} \u2014 leaderboard**", "-# ranked by bingo points"]
+    if not rows:
+        lines.append("_No points scored yet._")
+    medals = {1: "\U0001f947", 2: "\U0001f948", 3: "\U0001f949"}
+    for r in rows[:10]:
+        mark = medals.get(r["rank"], f"`{r['rank']:>2}.`")
+        lines.append(f"{mark} **{r['name']}** \u2014 {r['total']} pts")
+    return "\n".join(lines)
+
+
+_CONFIRM_TIMEOUT_SECONDS = 15 * 60
+
+
+class _OwnerConfirmView(discord.ui.View):
+    """Confirm/Cancel buttons for owner changes proposed in chat.
+
+    Changes are applied only when the owner (by Discord id, from the button
+    interaction) presses Confirm. Anyone else pressing a button is refused privately.
+    State is in memory, so pending confirmations expire on timeout or bot restart.
+    """
+
+    def __init__(self, *, guild_id: str, owner_id: str, changes: list[ProposedChange]) -> None:
+        super().__init__(timeout=_CONFIRM_TIMEOUT_SECONDS)
+        self.guild_id = guild_id
+        self.owner_id = owner_id
+        self.changes = list(changes)
+        self.message: discord.Message | None = None
+        self._done = False
+        self._lock = asyncio.Lock()
+
+    def prompt_text(self) -> str:
+        lines = ["**Pending changes \u2014 Mochi, confirm to apply:**"]
+        lines += [f"{i}. {c.summary}" for i, c in enumerate(self.changes, 1)]
+        lines.append("-# Expires in 15 minutes. Only Mochi can confirm.")
+        return "\n".join(lines)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        uid = str(interaction.user.id)
+        if uid == self.owner_id and owner_agent.is_owner(uid):
+            return True
+        await interaction.response.send_message("Only Mochi can confirm this.", ephemeral=True)
+        await asyncio.to_thread(
+            dao.record_event,
+            level="WARNING",
+            category="tool.denied",
+            message="non-owner pressed an owner confirm button",
+            actor=uid,
+            guild_id=self.guild_id,
+            context={"proposals": [c.summary for c in self.changes]},
+        )
+        return False
+
+    async def _finish(self, interaction: discord.Interaction, body: str) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        if interaction.response.is_done():
+            await interaction.edit_original_response(
+                content=body, view=self, allowed_mentions=discord.AllowedMentions.none()
+            )
+        else:
+            await interaction.response.edit_message(
+                content=body, view=self, allowed_mentions=discord.AllowedMentions.none()
+            )
+        self.stop()
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button["_OwnerConfirmView"]
+    ) -> None:
+        async with self._lock:
+            if self._done:
+                return
+            self._done = True
+            await interaction.response.defer()
+            actor_id = str(interaction.user.id)
+            results: list[str] = []
+            for change in self.changes:
+                try:
+                    results.append(
+                        await asyncio.to_thread(
+                            owner_agent.apply_change,
+                            change,
+                            guild_id=self.guild_id,
+                            actor_id=actor_id,
+                        )
+                    )
+                except Exception as e:
+                    logger.error(traceback.format_exc())
+                    results.append(f"Failed: {change.summary} ({e})")
+            body = "**Applied:**\n" + "\n".join(f"{i}. {r}" for i, r in enumerate(results, 1))
+            await self._finish(interaction, body)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button["_OwnerConfirmView"]
+    ) -> None:
+        async with self._lock:
+            if self._done:
+                return
+            self._done = True
+            await self._finish(interaction, "~~" + self.prompt_text() + "~~\nCancelled.")
+
+    async def on_timeout(self) -> None:
+        if self._done or self.message is None:
+            return
+        self._done = True
+        try:
+            await self.message.edit(
+                content="~~" + self.prompt_text() + "~~\nExpired, nothing was changed.",
+                view=None,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logger.warning("could not mark owner confirm prompt as expired")
 
 
 class FCBClient(discord.Client):
@@ -1925,67 +2044,6 @@ class FCBClient(discord.Client):
             question = re.sub(rf"@{re.escape(name)}", "", question, flags=re.IGNORECASE)
         question = question.strip()
 
-        # If a bingo challenge is active and they're asking about it, answer with the
-        # board image instead of persona prose.
-        try:
-            active_now = await asyncio.to_thread(dao.list_active_events, guild_id)
-            bingo_ids = await asyncio.to_thread(bingo_store.get_bingo_event_ids, guild_id)
-            bingo_event = next((e for e in active_now if int(e["id"]) in bingo_ids), None)
-        except Exception:
-            logger.error(traceback.format_exc())
-            bingo_event = None
-        # The owner's requests are open-ended (swap a square, regrade, look up someone),
-        # so only plain short asks use the canned board/leaderboard shortcuts; anything
-        # else goes to the chat agent, which has the owner tools.
-        if is_owner and (
-            len(question.split()) > 6
-            or any(not u.bot and u.id != message.author.id for u in message.mentions)
-        ):
-            bingo_event = None
-        if bingo_event is not None and re.search(
-            r"\b(leaderboard|standings?|rankings?|first place|who.?s winning|top \d+)\b",
-            question,
-            re.IGNORECASE,
-        ):
-            rows = await asyncio.to_thread(bingo_store.leaderboard_rows, int(bingo_event["id"]))
-            name = bingo_event.get("name") or "Fitness Bingo"
-            lines = [f"**{name} \u2014 leaderboard**", "-# ranked by bingo points"]
-            if not rows:
-                lines.append("_No points scored yet._")
-            else:
-                medals = {1: "\U0001f947", 2: "\U0001f948", 3: "\U0001f949"}
-                for r in rows[:10]:
-                    mark = medals.get(r["rank"], f"`{r['rank']:>2}.`")
-                    lines.append(f"{mark} **{r['name']}** \u2014 {r['total']} pts")
-            await message.reply("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
-            return
-        # Questions about the rules ("how many points is a blackout?") go to the chat
-        # agent, which has the generated scoring rules; only card/progress asks get the
-        # canned board image.
-        pattern_names = "|".join(
-            re.escape(label) for label in bingo_scoring.PATTERN_LABELS.values()
-        )
-        asks_rules = re.search(
-            rf"\b(rules?|worth|bonus(es)?|explain|scoring|how (does|do)|points? (for|is|are)"
-            rf"|{pattern_names})\b",
-            question,
-            re.IGNORECASE,
-        )
-        if bingo_event is not None and not asks_rules and re.search(
-            r"\b(bingo|card|cards|board|scorecard|status|progress)\b",
-            question,
-            re.IGNORECASE,
-        ):
-            board = await asyncio.to_thread(
-                bingo_store.member_board_state,
-                int(bingo_event["id"]),
-                invoker_id,
-                bingo_event.get("name") or "Fitness Bingo",
-            )
-            await self._send_bingo_card(
-                message, board, invoker_id, message.author.display_name, "here\u2019s your bingo card:"
-            )
-            return
         if not question:
             question = "(no question, just a hello)"
 
@@ -2245,6 +2303,7 @@ class FCBClient(discord.Client):
                     }
                 )
 
+            effects = ChatEffects()
             try:
                 reply_text = await asyncio.to_thread(
                     voice.chat_reply,
@@ -2264,6 +2323,7 @@ class FCBClient(discord.Client):
                         if any(int(e["id"]) in chat_bingo_ids for e in active_events)
                         else None
                     ),
+                    effects=effects,
                 )
             except Exception as e:
                 logger.error(traceback.format_exc())
@@ -2347,15 +2407,70 @@ class FCBClient(discord.Client):
         # Reply as a Discord reply so the author gets pinged naturally. Long
         # answers are split across messages to stay under Discord's length cap;
         # only the first chunk pings.
-        chunks = _split_for_discord(reply_text)
-        await message.reply(
-            chunks[0],
-            allowed_mentions=discord.AllowedMentions(
-                everyone=False, users=False, roles=False, replied_user=True
-            ),
-        )
+        # Empty text means a tool already queued the whole answer (see voice.chat_reply).
+        chunks = _split_for_discord(reply_text) if reply_text else []
+        if chunks:
+            await message.reply(
+                chunks[0],
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, users=False, roles=False, replied_user=True
+                ),
+            )
         for chunk in chunks[1:]:
             await message.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+        await self._post_chat_effects(guild_id, message, effects)
+
+    async def _post_chat_effects(
+        self, guild_id: str, message: discord.Message, effects: ChatEffects
+    ) -> None:
+        """Post what the chat tools queued: card images, leaderboard, owner proposals."""
+        invoker_id = str(message.author.id)
+        if effects.cards or effects.leaderboard:
+            active = await asyncio.to_thread(dao.list_active_events, guild_id)
+            bingo_ids = await asyncio.to_thread(bingo_store.get_bingo_event_ids, guild_id)
+            event = next((e for e in active if int(e["id"]) in bingo_ids), None)
+            if event is not None:
+                event_name = event.get("name") or "Fitness Bingo"
+                for user_id, display_name in effects.cards:
+                    board = await asyncio.to_thread(
+                        bingo_store.member_board_state, int(event["id"]), user_id, event_name
+                    )
+                    own = user_id == invoker_id
+                    lead = (
+                        "here\u2019s your bingo card:"
+                        if own
+                        else f"here\u2019s {discord.utils.escape_markdown(display_name)}\u2019s "
+                        "bingo card:"
+                    )
+                    await self._send_bingo_card(
+                        message, board, user_id, display_name, lead, ping=own
+                    )
+                if effects.leaderboard:
+                    rows = await asyncio.to_thread(bingo_store.leaderboard_rows, int(event["id"]))
+                    await message.reply(
+                        _format_bingo_leaderboard(event_name, rows),
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+        if not effects.proposals:
+            return
+        if not owner_agent.is_owner(invoker_id):
+            # Owner tools are never built for non-owners, so this means a bug upstream.
+            logger.error(f"dropping {len(effects.proposals)} owner proposals for {invoker_id}")
+            await asyncio.to_thread(
+                dao.record_event,
+                level="ERROR",
+                category="tool.denied",
+                message="owner proposals produced for a non-owner were dropped",
+                actor=invoker_id,
+                guild_id=guild_id,
+                context={"proposals": [p.summary for p in effects.proposals]},
+            )
+            return
+        view = _OwnerConfirmView(guild_id=guild_id, owner_id=invoker_id, changes=effects.proposals)
+        view.message = await message.channel.send(
+            view.prompt_text(), view=view, allowed_mentions=discord.AllowedMentions.none()
+        )
 
     async def _post_hardcore_riff(
         self,
@@ -2426,11 +2541,13 @@ class FCBClient(discord.Client):
         display_name: str,
         lead: str,
         footer: str = "",
+        ping: bool = True,
     ) -> discord.Message:
         """Render the member's board and reply with it as an image attachment.
 
         ``footer`` is appended after the points summary (used for a clarification
-        question). Returns the sent message.
+        question). ``ping=False`` leaves out the card owner's mention, used when someone
+        asks to see another member's card. Returns the sent message.
         """
         event_id = int(board_state["event_id"])
         rank = await asyncio.to_thread(bingo_store.member_rank, event_id, user_id)
@@ -2438,11 +2555,15 @@ class FCBClient(discord.Client):
         files = [discord.File(io.BytesIO(b), filename=n) for n, b in images]
         total = board_state["total"]
         summary = f" ({total} pts total" + (f", rank #{rank}" if rank else "") + ")"
+        prefix = f"<@{user_id}> " if ping else ""
+        mentions = discord.AllowedMentions(
+            everyone=False, roles=False, users=ping, replied_user=True
+        )
         if files:
             return await message.reply(
-                content=f"<@{user_id}> {lead}{summary}{footer}", files=files
+                content=f"{prefix}{lead}{summary}{footer}", files=files, allowed_mentions=mentions
             )
-        return await message.reply(content=f"<@{user_id}> {lead}{footer}")
+        return await message.reply(content=f"{prefix}{lead}{footer}", allowed_mentions=mentions)
 
     @staticmethod
     def _bingo_crossed_lead(board_before: dict, board_after: dict, crossed: list[dict]) -> str:
