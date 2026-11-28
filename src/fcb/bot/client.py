@@ -442,6 +442,24 @@ def _split_for_discord(text: str, limit: int = _DISCORD_MESSAGE_LIMIT) -> list[s
     return [c for c in chunks if c.strip()]
 
 
+def _bingo_checkin_outcome(
+    needs_clarification: bool, clarification_question: str | None, any_matched: bool
+) -> tuple[str | None, str]:
+    """Decide whether a bingo check-in asks the member a question, and its status.
+
+    Returns ``(question_to_ask, status)``. A question is only asked when nothing was
+    matched: if the check-in already earns squares, asking reads as if those points were
+    in doubt, and the answer can't change them. ``pending`` is used only while a question
+    is actually open, so a check-in never sits pending with nothing to answer.
+    """
+    question = (clarification_question or "").strip()
+    if any_matched:
+        return None, "approved"
+    if needs_clarification and question:
+        return question, "pending"
+    return None, "rejected"
+
+
 def _format_bingo_leaderboard(event_name: str, rows: list[dict[str, Any]]) -> str:
     lines = [f"**{event_name} \u2014 leaderboard**", "-# ranked by bingo points"]
     if not rows:
@@ -2653,12 +2671,19 @@ class FCBClient(discord.Client):
         ]
         chosen = bingo_scoring.solve_assignment(candidates, lambda c: str(c))
 
-        status = "approved" if chosen else ("pending" if result.needs_clarification else "rejected")
-        # A question is asked whenever the model has one, even if some squares were
-        # crossed (e.g. 7 clear, 1 ambiguous). The flag routes the member's reply to
-        # _handle_bingo_clarification_reply.
-        question = (result.clarification_question or "").strip()
-        asking = bool(result.needs_clarification and question)
+        # Only ask when nothing matched (see _bingo_checkin_outcome). A question the model
+        # wanted to ask on a check-in that earned squares is dropped, but kept in the
+        # bingo.checkin log so an admin can still see which square might have been missed.
+        ask, status = _bingo_checkin_outcome(
+            result.needs_clarification, result.clarification_question, bool(chosen)
+        )
+        asking = ask is not None
+        question = ask or ""
+        dropped_question = (
+            (result.clarification_question or "").strip() or None
+            if chosen and result.needs_clarification
+            else None
+        )
         submission_id = await asyncio.to_thread(
             dao.insert_submission,
             guild_id=guild_id,
@@ -2723,34 +2748,28 @@ class FCBClient(discord.Client):
                 "event_id": event_id,
                 "crossed": [f"{sq['card_key']}:{sq['cell_index']}" for sq in crossed],
                 "needs_clarification": result.needs_clarification,
+                "dropped_question": dropped_question,
             },
         )
 
         reply_hint = (
             "\n-# Reply to this message to answer and I\u2019ll re-check those images."
         )
-        sent: discord.Message
-        if not crossed:
-            if asking:
-                sent = await message.reply(f"<@{author_id}> {question}{reply_hint}")
-            else:
-                await self._send_bingo_card(
-                    message, board_before, author_id, display_name,
-                    "I logged that, but it didn\u2019t match any open square on your cards yet. "
-                    "Here\u2019s where you stand:",
-                )
-                return
-        else:
+        if crossed:
             board_after = await asyncio.to_thread(
                 bingo_store.member_board_state, event_id, author_id, event_name
             )
             lead = self._bingo_crossed_lead(board_before, board_after, crossed)
-            footer = f"\n\u2753 One more question: {question}{reply_hint}" if asking else ""
-            sent = await self._send_bingo_card(
-                message, board_after, author_id, display_name, lead, footer
+            await self._send_bingo_card(message, board_after, author_id, display_name, lead)
+            return
+        if not asking:
+            await self._send_bingo_card(
+                message, board_before, author_id, display_name,
+                "I logged that, but it didn\u2019t match any open square on your cards yet. "
+                "Here\u2019s where you stand:",
             )
-            if not asking:
-                return
+            return
+        sent = await message.reply(f"<@{author_id}> {question}{reply_hint}")
 
         await asyncio.to_thread(dao.set_clarification_message_id, submission_id, str(sent.id))
         await asyncio.to_thread(
@@ -2954,12 +2973,21 @@ class FCBClient(discord.Client):
         )
 
         if not crossed:
-            lead = (
-                "thanks! Your board is fully crossed already."
-                if not opens
-                else "thanks! I re-checked with your answer, but it didn\u2019t cross off "
-                "anything new. Here\u2019s where you stand:"
-            )
+            if not opens:
+                lead = "thanks! Your board is fully crossed already."
+            elif credited:
+                # Questions asked before the ask-only-when-nothing-matched rule may sit on
+                # check-ins that already earned squares; say those still count.
+                n = len(credited)
+                lead = (
+                    f"thanks! The {n} square{'s' if n != 1 else ''} from this check-in still "
+                    "count, and that answer didn\u2019t add any more. Here\u2019s where you stand:"
+                )
+            else:
+                lead = (
+                    "thanks! Even with that, it doesn\u2019t match an open square, so "
+                    "nothing was crossed for this one. Here\u2019s where you stand:"
+                )
             await self._send_bingo_card(message, board_before, author_id, display_name, lead)
             return
         board_after = await asyncio.to_thread(
