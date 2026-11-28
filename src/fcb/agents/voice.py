@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 from strands import Agent
 from strands.types.content import ContentBlock
 
-from fcb.agents import bedrock_model, owner, tool_policy
+from fcb.agents import bedrock_model, member_tools, owner, tool_policy
 from fcb.agents.chat_effects import ChatEffects
 from fcb.db import dao
 
@@ -519,6 +519,29 @@ def get_voice_settings(guild_id: str) -> dict[str, str]:
     return {**_DEFAULTS, **{k: v for k, v in stored.items() if v.strip()}}
 
 
+def _chat_answer_text(messages: list[Any]) -> str:
+    """The user-facing answer from a chat agent's tool loop.
+
+    The final assistant message is often empty when the model wrote its answer and then
+    called a posting tool (card image, leaderboard) in the same turn. So the answer is
+    the text of the final assistant message plus the text of every assistant message
+    whose tool calls are all posting tools. Text next to lookup tools ("let me check
+    your cards") is working, not answer, and is left out.
+    """
+    assistant = [m for m in messages if m.get("role") == "assistant"]
+    parts: list[str] = []
+    for i, msg in enumerate(assistant):
+        blocks = msg.get("content") or []
+        tools = {b["toolUse"]["name"] for b in blocks if isinstance(b, dict) and "toolUse" in b}
+        if i == len(assistant) - 1 or (tools and tools <= member_tools.POSTING_TOOLS):
+            text = "\n".join(
+                str(b["text"]).strip() for b in blocks if isinstance(b, dict) and b.get("text")
+            ).strip()
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts)
+
+
 def _first_text(result: Any) -> str:
     msg = getattr(result, "message", None)
     if not msg:
@@ -830,8 +853,11 @@ CHAT_TOOLS_INSTRUCTION = """\
 Tools: you have tools for bingo questions. Tool results count as factual data, \
 alongside the context buckets.
 - show_bingo_card: posts a member's bingo board image right after your reply. Use it \
-when someone asks to see, show, or check a card, theirs or another member's. Don't \
-describe the whole board in text when the image is going up; a short line is enough.
+when someone asks to see, show, or pull up a card, theirs or another member's. Don't \
+use it just because a question is about cards: "review my cards and give me a \
+strategy" wants the strategy, not the image. If you do post the image, don't re-list \
+every square in text, but still fully answer anything else they asked (a plan, an \
+analysis, a comparison).
 - show_leaderboard: posts the bingo leaderboard right after your reply. Use it for \
 leaderboard, standings, rankings, or who's-winning questions.
 - bingo_overview and bingo_card: read anyone's bingo points, patterns, and squares. \
@@ -966,9 +992,10 @@ def chat_reply(
             {"text": prompt},
             {"image": {"format": image_format, "source": {"bytes": image_bytes}}},
         ]
-        text = _first_text(agent(message_content))
+        agent(message_content)
     else:
-        text = _first_text(agent(prompt))
+        agent(prompt)
+    text = _chat_answer_text(agent.messages)
     if text:
         return text
     # A tool already queued the answer (card image, leaderboard, proposals): post that

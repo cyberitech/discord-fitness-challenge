@@ -29,6 +29,11 @@ _GUILD_MEMBER_CLAUSE = (
 )
 
 
+# Tools whose job is to post something after the reply. Text the model writes in the
+# same turn as these is part of its answer (see voice._chat_answer_text).
+POSTING_TOOLS = frozenset({"show_bingo_card", "show_leaderboard"})
+
+
 def resolve_member(
     query: str, *, guild_id: str, scope_to_guild: bool
 ) -> tuple[dict[str, Any] | None, str | None]:
